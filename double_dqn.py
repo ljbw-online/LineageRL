@@ -22,94 +22,89 @@ def write_timestep(i, data):
             replay_buffer['episode'][key][i]
         )
 
+    # jax.debug.print(
+    #     'i={x}, act={y}', x=i,
+    #     y=replay_buffer['episode']['action'][i]
+    # )
+
     # We have to return buffer_offset because a loop body has to return
     # something with the same pytree structure as what it receives.
     return replay_buffer, buffer_offset
 
 
-def add_episode(
-    replay_buffer
-):
+def add_episode(replay_buffer):
     buffer_length = replay_buffer['observation'].shape[0]
 
     length = replay_buffer['episode']['step_count']
+
     boundaries = replay_buffer['boundaries']
-    max_episodes = boundaries.shape[0]
-
     add_bounds_index = replay_buffer['add_bounds_index']
+    start_index = replay_buffer['add_episode_index']
 
-    start_index = boundaries[(add_bounds_index - 1) % max_episodes, 1]
+    buffer_end_reached = start_index + length > buffer_length
+
+    # If there isn't enough space for the episode at the end of the buffer
+    # then put it at the beginning, otherwise put it directly after the
+    # previous episode.
+    start_index = jnp.where(
+        buffer_end_reached,
+        0,
+        start_index
+    )
+
     end_index = start_index + length
-
-    buffer_end_reached = end_index > buffer_length
-
-    # If we can't put the episode at the end of the buffer then wrap around to
-    # the beginning.
-    start_index = jnp.where(buffer_end_reached, 0, start_index)
-    end_index = start_index + length
-
-    # boundaries = (
-    #     boundaries.at[add_position].set([start_index, end_index])
-    # )
 
     boundaries, add_bounds_index = circular_put(
         boundaries, add_bounds_index, [start_index, end_index]
     )
 
-    # jax.debug.print('before fori')
+    replay_buffer['boundaries'] = boundaries
+    replay_buffer['add_bounds_index'] = add_bounds_index
+    replay_buffer['add_episode_index'] = end_index
+
     replay_buffer, _ = lax.fori_loop(
         0, length, write_timestep,
         (replay_buffer, start_index)
     )
-    # jax.debug.print('after fori')
-
-    first_episode_position = replay_buffer['first_episode_position']
 
     # Record whether the buffer capacity has been reached so far
     replay_buffer['wrapped'] = jnp.logical_or(
         replay_buffer['wrapped'], buffer_end_reached
     )
 
-    def overlap(first_ep_pos):
+    def overlap_check(replay_buffer):
         # jax.debug.print(
         #     'cap_r {a}, end_i {b}, bound {c}', a=capacity_reached,
         #     b=end_index, c=boundaries[first_ep_pos, 0]
         # )
+        least_recent_ep_start = replay_buffer['least_recent_bounds'][0]
 
         return jnp.logical_and(
-            buffer_end_reached,
-            end_index < boundaries[first_ep_pos, 0]
+            replay_buffer['wrapped'],
+            end_index < least_recent_ep_start
         )
 
-    def get_least_recent(replay_buffer):
-        (
-            replay_buffer['least_recent_bounds'],
-            replay_buffer['least_recent_bounds_index']
-        ) = (
-                circular_get(
-                    replay_buffer['boundaries'],
-                    replay_buffer['least_recent_bounds_index']
-                )
+    def update_least_recent_bounds(replay_buffer):
+        boundaries = replay_buffer['boundaries']
+        least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
+
+        least_recent_bounds, least_recent_bounds_index = circular_get(
+            boundaries, least_recent_bounds_index
         )
 
-    jax.debug.print('before while')
+        replay_buffer['least_recent_bounds'] = least_recent_bounds
+        replay_buffer['least_recent_bounds_index'] = least_recent_bounds_index
+
+        return replay_buffer
+
+    # jax.debug.print('before while')
     # while_loop :: (a -> Bool) -> (a -> a) -> (a -> a)
-    first_episode_position = lax.while_loop(
-        # lambda fep: jnp.logical_and(
-        #     capacity_reached,
-        #     end_index > boundaries[fep, 0]
-        # ),
-        overlap,
-        lambda n: (n + 1) % max_episodes,
-        first_episode_position
+    replay_buffer = lax.while_loop(
+        overlap_check,
+        update_least_recent_bounds,
+        replay_buffer
     )
-    jax.debug.print('after while')
-
-    replay_buffer['first_episode_position'] = first_episode_position
-
-    replay_buffer['add_position'] = (add_bounds_index + 1) % max_episodes
-
-    replay_buffer['boundaries'] = boundaries
+    # jax.debug.print('after while')
 
     return replay_buffer
 
@@ -131,21 +126,37 @@ def add_timestep_to_episode(
 
 
 @jax.jit
-def add_timestep(
-    timestep, replay_buffer
-):
-    # episode = replay_buffer['episode']
+def add_timestep(timestep, replay_buffer):
+    # Record whether we got terminated on the previous step
+    episode = replay_buffer['episode']
+    # Jax clamps too-large indices but wraps negative indices
+    prev_term_index = jnp.maximum(0, episode['step_count'] - 1)
+    terminated = episode['terminated'][prev_term_index]
 
+    # Increments step_count
     episode = (
-        add_timestep_to_episode(timestep, replay_buffer['episode'])
+        add_timestep_to_episode(timestep, episode)
     )
 
     # We reached the max episode length or we got terminated on the previous
     # step.
     should_add_episode = jnp.logical_or(
         episode['step_count'] == replay_buffer['max_episode_length'],
-        episode['terminated'][episode['step_count'] - 1]
+        terminated
     )
+
+    # lax.cond(
+    #     should_add_episode,
+    #     lambda pair: jax.debug.print(
+    #         's_c {a}, mel {b}, s_c==mel {c}, prev_term {d}',
+    #         a=episode['step_count'],
+    #         b=replay_buffer['max_episode_length'],
+    #         c=episode['step_count'] == replay_buffer['max_episode_length'],
+    #         d=terminated
+    #     ),
+    #     lambda _: None,
+    #     (timestep['action'], episode['step_count'])
+    # )
 
     # jax.debug.print('before add_ep')
     replay_buffer = lax.cond(
@@ -162,22 +173,26 @@ def add_timestep(
     return replay_buffer
 
 
-@jax.jit
+@jax.jit(static_argnums=2)
 def get_batch(key, replay_buffer, sequence_length):
     batch_size = 32
-    add_position = replay_buffer['add_position']
-    overwrite_position = replay_buffer['first_episode_position']
+    add_bounds_index = replay_buffer['add_bounds_index']
+    least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
     max_episodes = replay_buffer['boundaries'].shape[0]
     # buffer_length = replay_buffer['action'].shape[0]
 
     # The mod operator keeps this positive
-    choice_range = (add_position - overwrite_position) % max_episodes
+    offset_range = (
+        (add_bounds_index - least_recent_bounds_index) % max_episodes
+    )
+
+    choice_range = max_episodes
 
     key, subkey = jrd.split(key)
 
     # Episode choices
     choices = (
-        (jrd.choice(subkey, choice_range, shape=(32,)) + add_position)
+        (jrd.choice(subkey, choice_range, shape=(32,)) + add_bounds_index)
         % max_episodes
     )
 
@@ -228,7 +243,7 @@ def get_batch(key, replay_buffer, sequence_length):
         for k in ['action', 'reward', 'terminated']:
             batch[k] = batch[k].at[i].set(replay_buffer[k][seq_start: seq_end])
 
-    return batch
+    return key, batch
 
 
 def get_replay_buffer(
@@ -245,6 +260,7 @@ def get_replay_buffer(
         'add_bounds_index': jnp.int32(0),
         'least_recent_bounds_index': jnp.int32(0),
         'least_recent_bounds': jnp.zeros(2, dtype=jnp.int32),
+        'add_episode_index': jnp.int32(0),
         'wrapped': jnp.bool(0),
         'max_episode_length': jnp.int32(max_episode_length),
         'episode': {
@@ -282,20 +298,24 @@ def add_test_episode(replay_buffer, max_episode_length, j):
     return replay_buffer
 
 
+def add_random_test_episode(replay_buffer, max_episode_length):
+    # Randint is inclusive of the upper bound
+    j = randint(2, max_episode_length)
+
+    return add_test_episode(replay_buffer, max_episode_length, j)
+
+
 def run_episode(env, replay_buffer):
     max_len = replay_buffer['max_episode_length']
     observation = env.reset()
     terminated = False
 
-    add_pos = replay_buffer['add_position']
-
-    print('starting ep', add_pos)
     for _ in range(max_len):
         if terminated:
             replay_buffer = add_timestep(
                 {
                     'observation': observation,
-                    'action': 0,
+                    'action': 5,
                     'reward': 0,
                     'terminated': False
                 },
@@ -303,7 +323,7 @@ def run_episode(env, replay_buffer):
             )
             break
 
-        action = randint(0, 3)
+        action = randint(1, 3)
         observation_next, reward, terminated, _, _ = env.step(action)
 
         timestep = {
@@ -317,16 +337,7 @@ def run_episode(env, replay_buffer):
 
         observation = observation_next
 
-    print('finished ep', add_pos, '\n')
     return replay_buffer
-
-
-def add_random_test_episode(replay_buffer, max_episode_length):
-
-    # Randint is inclusive of the upper bound
-    j = randint(2, max_episode_length)
-
-    return add_test_episode(replay_buffer, max_episode_length, j)
 
 
 class Agent:
@@ -335,34 +346,20 @@ class Agent:
 
 
 if __name__ == '__main__':
+    from time import sleep
     from environments.random_grey_walls import Env
     max_ep_len = 10
     env = Env(size=2, safe_boundaries=True)
 
-    rb = get_replay_buffer(20, max_ep_len, (2, 2))
+    rb = get_replay_buffer(30, max_ep_len, (2, 2))
+
+    key = jrd.key(int(random() * 1e9))
 
     for i in range(300):
         rb = run_episode(env, rb)
 
+        sleep(1)
+
         print(rb['action'])
-        print(rb['boundaries'])
+        print(get_batch(key, rb, 2))
         input()
-
-    for key, value in rb.items():
-        if key != 'episode':
-            print(key, value)
-
-    fep = rb['first_episode_position']
-    add_p = rb['add_position']
-
-    print('fep:', fep, 'add_p:', add_p)
-
-    if fep < add_p:
-        for i in range(fep, add_p):
-            print(rb['boundaries'][i])
-    else:
-        for i in range(fep, rb['boundaries'].shape[0]):
-            print(rb['boundaries'][i])
-
-        for i in range(0, add_p):
-            print(rb['boundaries'][i])
