@@ -181,18 +181,21 @@ def get_batch(key, replay_buffer, sequence_length):
     max_episodes = replay_buffer['boundaries'].shape[0]
     # buffer_length = replay_buffer['action'].shape[0]
 
-    # The mod operator keeps this positive
-    offset_range = (
+    # Using the mod operator makes this correct even when
+    # add_bounds_index < least_recent_bounds_index.
+    # This isn't correct if both of them are zero, but that isn't possible
+    # when the number of bounds is equal to the buffer length and the
+    # shortest episode is two timesteps.
+    num_stored_episodes = (
         (add_bounds_index - least_recent_bounds_index) % max_episodes
     )
 
-    choice_range = max_episodes
-
     key, subkey = jrd.split(key)
 
-    # Episode choices
+    # Episode choices, using randint because jrd.choice doesn't like tracers.
     choices = (
-        (jrd.choice(subkey, choice_range, shape=(32,)) + add_bounds_index)
+        (jrd.randint(subkey, (32,), 0, num_stored_episodes)
+            + least_recent_bounds_index)
         % max_episodes
     )
 
@@ -215,33 +218,28 @@ def get_batch(key, replay_buffer, sequence_length):
         lower = bounds[0]
         upper = bounds[1]
 
-        # Unnecessary because we're not storing episodes across the buffer
-        # boundary.
-        # ep_len = jnp.where(
-        #     upper > lower,
-        #     upper - lower,
-        #     max_episodes - lower + upper
-        # )
-
         ep_len = upper - lower
 
-        key, subkey = jrd.split(key)
-        seq_start = jrd.choice(subkey, ep_len - sequence_length + 1)
-        seq_end = seq_start + sequence_length
+        # TODO: ensure sequences ending before t=seq_len get into batches
 
-        # Also unnecessary
-        # start_index = (lower + seq_start) % buffer_length
-        # end_index = (start_index + sequence_length) % buffer_length
+        key, subkey = jrd.split(key)
+        # seq_start = jrd.choice(subkey, ep_len - sequence_length + 1)
+        seq_start = jrd.randint(subkey, (), 0, ep_len - sequence_length + 1)
+        # seq_end = seq_start + sequence_length
+
+        seq_slice = jax.ds(seq_start, sequence_length)
 
         # Return observations channels-last
         batch['observation'] = batch['observation'].at[i].set(
             jnp.moveaxis(
-                replay_buffer['observation'][seq_start: seq_end], 0, -1
+                # replay_buffer['observation'][seq_start: seq_end], 0, -1
+                replay_buffer['observation'][seq_slice], 0, -1
             )
         )
 
         for k in ['action', 'reward', 'terminated']:
-            batch[k] = batch[k].at[i].set(replay_buffer[k][seq_start: seq_end])
+            # batch[k] = batch[k].at[i].set(replay_buffer[k][seq_start: seq_end])
+            batch[k] = batch[k].at[i].set(replay_buffer[k][seq_slice])
 
     return key, batch
 
@@ -358,8 +356,22 @@ if __name__ == '__main__':
     for i in range(300):
         rb = run_episode(env, rb)
 
-        sleep(1)
-
         print(rb['action'])
-        print(get_batch(key, rb, 2))
-        input()
+
+        key, batch = get_batch(key, rb, 2)
+        print(batch.keys())
+        for i in range(32):
+            obs = batch['observation'][i]
+            frame0 = obs[:, :, 0]
+            frame1 = obs[:, :, 1]
+
+            print(frame0)
+            print(frame1)
+
+            print(batch['action'][i, 0])
+            print(batch['reward'][i, 0])
+            print(batch['terminated'][i, 0])
+
+            input()
+
+        break
