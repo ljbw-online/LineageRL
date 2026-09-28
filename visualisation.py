@@ -81,7 +81,9 @@ def play_env(env, key_map, scale=None):
 
             if terminated:
                 print('terminated')
-                window.update(env.reset())
+                sleep(1)
+                obs, _ = env.reset()
+                window.update(obs)
 
         sleep(0.1)
 
@@ -211,19 +213,10 @@ class Window:
 
 
 if __name__ == '__main__':
-    # from environments.random_grey_walls import Env
-    # from networks import MLP
+    from environments.follow_the_dots import Env
 
-    # env = Env(size=9)
+    env = Env(8)
 
-    # net = MLP(9, 4)
+    key_map = {'left': 0, 'up': 1, 'right': 2, 'down': 3}
 
-    # observations = env.get_renderable_q_values(net)
-
-    # display_observations(observations[None, ...])
-
-    # key_map = {'left': 0, 'up': 1, 'right': 2, 'down': 3}
-
-    # play_env(env, key_map)
-
-    play_breakout()
+    play_env(env, key_map)

@@ -344,7 +344,6 @@ class Agent:
 
 
 if __name__ == '__main__':
-    from time import sleep
     from environments.random_grey_walls import Env
     max_ep_len = 10
     env = Env(size=2, safe_boundaries=True)
@@ -374,4 +373,4 @@ if __name__ == '__main__':
 
             input()
 
-        break
+        print('new ep')
