@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import jax.lax as lax
 import jax.random as jrd
+from flax import nnx
 
 
 def circular_get(buffer, start):
@@ -244,35 +245,6 @@ def get_batch(key, replay_buffer, sequence_length):
     return key, batch
 
 
-def get_replay_buffer(
-    buffer_length, max_episode_length, observation_shape
-):
-    observation_buffer_shape = (buffer_length,) + observation_shape
-    observation_episode_shape = (max_episode_length,) + observation_shape
-    return {
-        'observation': jnp.zeros(observation_buffer_shape, dtype=jnp.uint8),
-        'action': jnp.zeros(buffer_length, dtype=jnp.uint8),
-        'reward': jnp.zeros(buffer_length, dtype=jnp.float32),
-        'terminated': jnp.zeros(buffer_length, dtype=jnp.bool),
-        'boundaries': jnp.zeros((buffer_length, 2), dtype=jnp.int32),
-        'add_bounds_index': jnp.int32(0),
-        'least_recent_bounds_index': jnp.int32(0),
-        'least_recent_bounds': jnp.zeros(2, dtype=jnp.int32),
-        'add_episode_index': jnp.int32(0),
-        'wrapped': jnp.bool(0),
-        'max_episode_length': jnp.int32(max_episode_length),
-        'episode': {
-            'observation': jnp.zeros(
-                observation_episode_shape, dtype=jnp.uint8
-            ),
-            'action': jnp.zeros(max_episode_length, dtype=jnp.uint8),
-            'reward': jnp.zeros(max_episode_length, dtype=jnp.float32),
-            'terminated': jnp.zeros(max_episode_length, dtype=jnp.bool),
-            'step_count': jnp.int32(0),
-        }
-    }
-
-
 def add_test_episode(replay_buffer, max_episode_length, j):
     if j > max_episode_length:
         raise ValueError
@@ -338,15 +310,83 @@ def run_episode(env, replay_buffer):
     return replay_buffer
 
 
+def get_replay_buffer(buffer_length, max_episode_length, observation_shape):
+    observation_buffer_shape = (buffer_length,) + observation_shape
+    observation_episode_shape = (max_episode_length,) + observation_shape
+    return {
+        'observation': jnp.zeros(observation_buffer_shape, dtype=jnp.uint8),
+        'action': jnp.zeros(buffer_length, dtype=jnp.uint8),
+        'reward': jnp.zeros(buffer_length, dtype=jnp.float32),
+        'terminated': jnp.zeros(buffer_length, dtype=jnp.bool),
+        'boundaries': jnp.zeros((buffer_length, 2), dtype=jnp.int32),
+        'add_bounds_index': jnp.int32(0),
+        'least_recent_bounds_index': jnp.int32(0),
+        'least_recent_bounds': jnp.zeros(2, dtype=jnp.int32),
+        'add_episode_index': jnp.int32(0),
+        'wrapped': jnp.bool(0),
+        'max_episode_length': jnp.int32(max_episode_length),
+        'episode': {
+            'observation': jnp.zeros(
+                observation_episode_shape, dtype=jnp.uint8
+            ),
+            'action': jnp.zeros(max_episode_length, dtype=jnp.uint8),
+            'reward': jnp.zeros(max_episode_length, dtype=jnp.float32),
+            'terminated': jnp.zeros(max_episode_length, dtype=jnp.bool),
+            'step_count': jnp.int32(0),
+        }
+    }
+
+
+def get_state(buffer_length, max_episode_length, obs_shape, num_actions):
+    rngs = nnx.Rngs(int(random() * 1e12))
+    return {
+        'key': jrd.key(int(random() * 1e12)),
+        'replay_buffer': get_replay_buffer(
+            buffer_length, max_episode_length, obs_shape
+        ),
+        'main_net': Qnet(obs_shape, num_actions, rngs),
+        'target_net': Qnet(obs_shape, num_actions, rngs),
+    }
+
+
+@jax.jit
+def train(timestep, state):
+    rb = state['replay_buffer']
+    rb = add_timestep(timestep, rb)
+    action = 0
+    return action, state
+
+
+class Qnet(nnx.Module):
+    def __init__(self, obs_shape, num_actions, rngs):
+        self.size = obs_shape[0] * obs_shape[1]
+        self.linear0 = nnx.Linear(self.size, 128, rngs=rngs)
+        self.linear1 = nnx.Linear(128, num_actions, rngs=rngs)
+
+    def __call__(self, obs):
+        obs = obs.reshape(self.size) / 255.0
+        a = self.linear0(obs)
+        a = nnx.gelu(a)
+        a = self.linear1(a)
+        return a
+
+
 class Agent:
     def __init__(self):
         pass
 
 
 if __name__ == '__main__':
-    from environments.random_grey_walls import Env
-    max_ep_len = 10
-    env = Env(size=2, safe_boundaries=True)
+    from environments.follow_the_dots import Env
+    max_ep_len = 100
+    env = Env(size=8)
+
+    q = Qnet((8, 8), 4)
+
+    obs, _ = env.reset()
+
+    print(q(obs))
+    exit()
 
     rb = get_replay_buffer(30, max_ep_len, (2, 2))
 

@@ -74,8 +74,6 @@ class Env:
             reward = np.float32(term)
 
             return obs, reward, term, False, {}
-        else:
-            raise NotImplementedError
 
 
 if __name__ == '__main__':
