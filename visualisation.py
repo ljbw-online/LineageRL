@@ -215,7 +215,7 @@ class Window:
 if __name__ == '__main__':
     from environments.follow_the_dots import Env
 
-    env = Env(8)
+    env = Env(2)
 
     key_map = {'left': 0, 'up': 1, 'right': 2, 'down': 3}
 

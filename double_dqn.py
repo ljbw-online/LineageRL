@@ -110,16 +110,20 @@ def add_episode(replay_buffer):
     return replay_buffer
 
 
-def add_timestep_to_episode(
-    timestep, episode
-):
+def add_timestep_to_episode(timestep, episode):
     step_count = episode['step_count']
 
-    for key in ['observation', 'action', 'reward', 'terminated']:
-        # if key == 'observation':
-        #     jax.debug.print('obs shape {x}', x=episode[key][step_count].shape)
-        #     jax.debug.print('ts shape {x}', x=timestep[key].shape)
-        episode[key] = episode[key].at[step_count].set(timestep[key])
+    episode['observation'] = (
+        episode['observation'].at[step_count].set(timestep['observation'])
+    )
+
+    # Along with each observation we get the action, reward and terminated
+    # value for the previous step. When step_count == 0 we just write
+    # placeholders, and then write the actual values on the next step.
+    prev_step_count = jnp.maximum(0, step_count - 1)
+
+    for key in ['action', 'reward', 'terminated']:
+        episode[key] = episode[key].at[prev_step_count].set(timestep[key])
 
     episode['step_count'] = step_count + 1
 
@@ -135,9 +139,7 @@ def add_timestep(timestep, replay_buffer):
     terminated = episode['terminated'][prev_term_index]
 
     # Increments step_count
-    episode = (
-        add_timestep_to_episode(timestep, episode)
-    )
+    episode = add_timestep_to_episode(timestep, episode)
 
     # We reached the max episode length or we got terminated on the previous
     # step.
@@ -146,25 +148,10 @@ def add_timestep(timestep, replay_buffer):
         terminated
     )
 
-    # lax.cond(
-    #     should_add_episode,
-    #     lambda pair: jax.debug.print(
-    #         's_c {a}, mel {b}, s_c==mel {c}, prev_term {d}',
-    #         a=episode['step_count'],
-    #         b=replay_buffer['max_episode_length'],
-    #         c=episode['step_count'] == replay_buffer['max_episode_length'],
-    #         d=terminated
-    #     ),
-    #     lambda _: None,
-    #     (timestep['action'], episode['step_count'])
-    # )
-
-    # jax.debug.print('before add_ep')
     replay_buffer = lax.cond(
         should_add_episode, add_episode, lambda rb: rb,
         replay_buffer
     )
-    # jax.debug.print('after add_ep')
 
     # Reset step_count if we added the episode
     replay_buffer['episode']['step_count'] = (
@@ -180,7 +167,6 @@ def get_batch(key, replay_buffer, sequence_length):
     add_bounds_index = replay_buffer['add_bounds_index']
     least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
     max_episodes = replay_buffer['boundaries'].shape[0]
-    # buffer_length = replay_buffer['action'].shape[0]
 
     # Using the mod operator makes this correct even when
     # add_bounds_index < least_recent_bounds_index.
@@ -192,6 +178,8 @@ def get_batch(key, replay_buffer, sequence_length):
     )
 
     key, subkey = jrd.split(key)
+
+    # TODO: sample episodes with probability proportional to their length!
 
     # Episode choices, using randint because jrd.choice doesn't like tracers.
     choices = (
@@ -210,7 +198,7 @@ def get_batch(key, replay_buffer, sequence_length):
 
     batch = {
         'observation': jnp.zeros(obs_batch_shape, dtype=jnp.uint8),
-        'action': jnp.zeros((batch_size, sequence_length), dtype=jnp.uint8),
+        'action': jnp.zeros((batch_size, sequence_length), dtype=jnp.int32),
         'reward': jnp.zeros((batch_size, sequence_length), dtype=jnp.float32),
         'terminated': jnp.zeros((batch_size, sequence_length), dtype=jnp.bool)
     }
@@ -275,6 +263,18 @@ def add_random_test_episode(replay_buffer, max_episode_length):
     return add_test_episode(replay_buffer, max_episode_length, j)
 
 
+def display_batch(batch):
+    for i in range(batch['action'].shape[0]):
+        frame0 = batch['observation'][i, :, :, 0]
+        frame1 = batch['observation'][i, :, :, 1]
+
+        print(frame0)
+        print(frame1)
+
+        print(batch['action'][i], batch['reward'][i], batch['terminated'][i])
+        print()
+
+
 def run_episode(env, replay_buffer):
     max_len = replay_buffer['max_episode_length']
     observation = env.reset()
@@ -315,7 +315,7 @@ def get_replay_buffer(buffer_length, max_episode_length, observation_shape):
     observation_episode_shape = (max_episode_length,) + observation_shape
     return {
         'observation': jnp.zeros(observation_buffer_shape, dtype=jnp.uint8),
-        'action': jnp.zeros(buffer_length, dtype=jnp.uint8),
+        'action': jnp.zeros(buffer_length, dtype=jnp.int32),
         'reward': jnp.zeros(buffer_length, dtype=jnp.float32),
         'terminated': jnp.zeros(buffer_length, dtype=jnp.bool),
         'boundaries': jnp.zeros((buffer_length, 2), dtype=jnp.int32),
@@ -329,7 +329,7 @@ def get_replay_buffer(buffer_length, max_episode_length, observation_shape):
             'observation': jnp.zeros(
                 observation_episode_shape, dtype=jnp.uint8
             ),
-            'action': jnp.zeros(max_episode_length, dtype=jnp.uint8),
+            'action': jnp.zeros(max_episode_length, dtype=jnp.int32),
             'reward': jnp.zeros(max_episode_length, dtype=jnp.float32),
             'terminated': jnp.zeros(max_episode_length, dtype=jnp.bool),
             'step_count': jnp.int32(0),
@@ -344,16 +344,21 @@ def get_state(buffer_length, max_episode_length, obs_shape, num_actions):
         'replay_buffer': get_replay_buffer(
             buffer_length, max_episode_length, obs_shape
         ),
+        'num_actions': num_actions,
         'main_net': Qnet(obs_shape, num_actions, rngs),
         'target_net': Qnet(obs_shape, num_actions, rngs),
+        'num_steps': 0
     }
 
 
 @jax.jit
 def train(timestep, state):
     rb = state['replay_buffer']
-    rb = add_timestep(timestep, rb)
-    action = 0
+    state['replay_buffer'] = add_timestep(timestep, rb)
+
+    state['key'], subkey = jrd.split(state['key'])
+
+    action = jrd.randint(subkey, (), 0, state['num_actions'])
     return action, state
 
 
@@ -372,45 +377,53 @@ class Qnet(nnx.Module):
 
 
 class Agent:
-    def __init__(self):
-        pass
+    def __init__(self, buffer_len, max_ep_len, obs_shape, num_actions):
+        self.max_ep_len = max_ep_len
+        self.state = get_state(buffer_len, max_ep_len, obs_shape, num_actions)
+        self.env = Env(size=obs_shape[0])
+
+    def train(self, num_steps):
+        step_count = 0
+        while True:
+            obs, _ = self.env.reset()
+            terminated = False
+            timestep = {
+                'observation': obs,
+                'action': 0,
+                'reward': 0,
+                'terminated': False
+            }
+            for _ in range(self.max_ep_len):
+                step_count += 1
+
+                action, self.state = train(timestep, self.state)
+
+                if terminated:
+                    break
+
+                obs_next, reward, terminated, _, _ = self.env.step(action)
+                timestep = {
+                    'observation': obs_next,
+                    'action': action,
+                    'reward': reward,
+                    'terminated': terminated
+                }
+
+            if step_count >= num_steps:
+                break
 
 
 if __name__ == '__main__':
     from environments.follow_the_dots import Env
-    max_ep_len = 100
-    env = Env(size=8)
 
-    q = Qnet((8, 8), 4)
+    agent = Agent(200, 100, (2, 2), 4)
 
-    obs, _ = env.reset()
+    agent.train(200)
 
-    print(q(obs))
-    exit()
+    rb = agent.state['replay_buffer']
 
-    rb = get_replay_buffer(30, max_ep_len, (2, 2))
+    _, batch = get_batch(agent.state['key'], rb, 2)
 
-    key = jrd.key(int(random() * 1e9))
-
-    for i in range(300):
-        rb = run_episode(env, rb)
-
-        print(rb['action'])
-
-        key, batch = get_batch(key, rb, 2)
-        print(batch.keys())
-        for i in range(32):
-            obs = batch['observation'][i]
-            frame0 = obs[:, :, 0]
-            frame1 = obs[:, :, 1]
-
-            print(frame0)
-            print(frame1)
-
-            print(batch['action'][i, 0])
-            print(batch['reward'][i, 0])
-            print(batch['terminated'][i, 0])
-
-            input()
-
-        print('new ep')
+    while True:
+        display_batch(batch)
+        input('Press Enter\n')
