@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import jax.lax as lax
 import jax.random as jrd
 from flax import nnx
+import optax
 
 
 def circular_get(buffer, start):
@@ -161,9 +162,12 @@ def add_timestep(timestep, replay_buffer):
     return replay_buffer
 
 
-@jax.jit(static_argnums=2)
-def get_batch(key, replay_buffer, sequence_length):
+@jax.jit
+def get_batch(state):
     batch_size = 32
+    sequence_length = 2
+    replay_buffer = state['replay_buffer']
+
     add_bounds_index = replay_buffer['add_bounds_index']
     least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
     max_episodes = replay_buffer['boundaries'].shape[0]
@@ -177,7 +181,7 @@ def get_batch(key, replay_buffer, sequence_length):
         (add_bounds_index - least_recent_bounds_index) % max_episodes
     )
 
-    key, subkey = jrd.split(key)
+    state['key'], subkey = jrd.split(state['key'])
 
     # TODO: sample episodes with probability proportional to their length!
 
@@ -211,7 +215,7 @@ def get_batch(key, replay_buffer, sequence_length):
 
         # TODO: ensure sequences ending before t=seq_len get into batches
 
-        key, subkey = jrd.split(key)
+        state['key'], subkey = jrd.split(state['key'])
         # seq_start = jrd.choice(subkey, ep_len - sequence_length + 1)
         seq_start = jrd.randint(subkey, (), 0, ep_len - sequence_length + 1)
         # seq_end = seq_start + sequence_length
@@ -230,7 +234,7 @@ def get_batch(key, replay_buffer, sequence_length):
             # batch[k] = batch[k].at[i].set(replay_buffer[k][seq_start: seq_end])
             batch[k] = batch[k].at[i].set(replay_buffer[k][seq_slice])
 
-    return key, batch
+    return batch
 
 
 def add_test_episode(replay_buffer, max_episode_length, j):
@@ -339,15 +343,23 @@ def get_replay_buffer(buffer_length, max_episode_length, observation_shape):
 
 def get_state(buffer_length, max_episode_length, obs_shape, num_actions):
     rngs = nnx.Rngs(int(random() * 1e12))
+    main_net = Qnet(obs_shape, num_actions, rngs)
+    target_net = Qnet(obs_shape, num_actions, rngs)
+    main_optimiser = nnx.Optimizer(main_net, optax.adam(1e-4), wrt=nnx.Param)
+    target_optimiser = nnx.Optimizer(
+        target_net, optax.adam(1e-4), wrt=nnx.Param
+    )
     return {
         'key': jrd.key(int(random() * 1e12)),
         'replay_buffer': get_replay_buffer(
             buffer_length, max_episode_length, obs_shape
         ),
         'num_actions': num_actions,
-        'main_net': Qnet(obs_shape, num_actions, rngs),
-        'target_net': Qnet(obs_shape, num_actions, rngs),
-        'num_steps': 0
+        'main_net': main_net,
+        'target_net': target_net,
+        'num_steps': 0,
+        'main_optimiser': main_optimiser,
+        'target_optimiser': target_optimiser
     }
 
 
@@ -359,6 +371,8 @@ def train(timestep, state):
     state['key'], subkey = jrd.split(state['key'])
 
     action = jrd.randint(subkey, (), 0, state['num_actions'])
+
+    batch = get_batch(state)
     return action, state
 
 
@@ -422,8 +436,9 @@ if __name__ == '__main__':
 
     rb = agent.state['replay_buffer']
 
-    _, batch = get_batch(agent.state['key'], rb, 2)
+    assert any(rb['terminated'])
 
     while True:
+        batch = get_batch(agent.state)
         display_batch(batch)
-        input('Press Enter\n')
+        # input('Press Enter\n')
