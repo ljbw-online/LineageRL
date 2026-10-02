@@ -16,10 +16,10 @@ It took another five years of work by the DeepMind researchers and their collabo
 the most difficult games to be beaten. The result was Agent57, which was the first agent to
 attain at least average human performance on all 57 games. In the process of creating it the
 researchers had made inroads into some of the fundamental problems of reinforcement learning,
-such as how to explore a very treacherous environment.
+such as what to do when random exploration never discovers any rewards.
 
-In the [blog post announcing Agent57](https://deepmind.google/blog/agent57-outperforming-the-human-atari-benchmark/)
- its predecessors were referred to as the *lineage* of Agent57.
+In the [blog post announcing this agent](https://deepmind.google/blog/agent57-outperforming-the-human-atari-benchmark/)
+ its predecessors were referred to as the *lineage of Agent57*.
 
 This repository traces that lineage. I created it primarily to learn about the algorithms and
 how they are implemented in code. But I also hope that it will be useful to other people for that
