@@ -314,6 +314,109 @@ def run_episode(env, replay_buffer):
     return replay_buffer
 
 
+def get_regression_targets(batch, state):
+    main_net = state['main_net']
+    target_net = state['target_net']
+
+    next_step_obs = batch['observation'][:, :, :, 1:]
+
+    main_next_step_action_values = main_net(next_step_obs)
+    target_next_step_action_values = target_net(next_step_obs)
+
+    main_next_step_selected_actions = jnp.argmax(
+        main_next_step_action_values, axis=1
+    )
+
+    target_values_of_main_actions = target_next_step_action_values[
+        jnp.arange(next_step_obs.shape[0]), main_next_step_selected_actions
+    ]
+
+    rewards = batch['reward'][:, 0]
+    terminated = batch['terminated'][:, 0]
+    gamma = state['gamma']
+
+    targets = (
+        rewards
+        + jnp.logical_not(terminated) * gamma * target_values_of_main_actions
+    )
+
+    return targets
+
+
+def loss_fn(main_net, loss_batch):
+    main_q_values = main_net(loss_batch['observation'])
+    actions = loss_batch['action']
+    targets = loss_batch['target']
+
+    selected_q_values = main_q_values[
+        jnp.arange(main_q_values.shape[0]), actions
+    ]
+
+    return (selected_q_values - targets) ** 2
+
+
+loss_with_gradients = nnx.value_and_grad(loss_fn)
+
+
+def update_target_net(state):
+    main_net = state['main_net']
+    target_net = state['target_net']
+
+    _, main_params = nnx.split(main_net, nnx.Params)
+    # TODO: does this in-place update get into the state dict?
+    nnx.update(target_net, main_params)
+
+    state['main_updates_since_target_update'] = 0
+
+    return state
+
+
+def update_nets(state):
+    batch = get_batch(state)
+    main_net = state['main_net']
+    seq_len = state['seq_len']
+    optimiser = state['optimiser']
+
+    targets = get_regression_targets(batch, state)
+
+    loss_batch = {
+        'observation': batch['observation'][:, :, :, :seq_len],
+        'action': batch['action'],
+        'target': targets
+    }
+
+    loss, grads = loss_with_gradients(main_net, loss_batch)
+
+    # TODO: does this in-place update get into the state dict?
+    optimiser.update(main_net, grads)
+
+    state['main_updates_since_target_update'] += 1
+    state['loss'] = loss
+
+    state = lax.cond(
+        state['main_updates_since_target_update'] >= 1_000,
+        update_target_net,
+        lambda s: s,
+        state
+    )
+
+    return state
+
+
+@jax.jit
+def train(timestep, state):
+    state['key'], subkey = jrd.split(state['key'])
+    # TODO: epsilon-greedy
+    action = jrd.randint(subkey, (), 0, state['num_actions'])
+
+    rb = state['replay_buffer']
+    state['replay_buffer'] = add_timestep(timestep, rb)
+
+    state = update_nets(state)
+
+    return action, state
+
+
 def get_replay_buffer(buffer_length, max_episode_length, observation_shape):
     observation_buffer_shape = (buffer_length,) + observation_shape
     observation_episode_shape = (max_episode_length,) + observation_shape
@@ -345,10 +448,7 @@ def get_state(buffer_length, max_episode_length, obs_shape, num_actions):
     rngs = nnx.Rngs(int(random() * 1e12))
     main_net = Qnet(obs_shape, num_actions, rngs)
     target_net = Qnet(obs_shape, num_actions, rngs)
-    main_optimiser = nnx.Optimizer(main_net, optax.adam(1e-4), wrt=nnx.Param)
-    target_optimiser = nnx.Optimizer(
-        target_net, optax.adam(1e-4), wrt=nnx.Param
-    )
+    optimiser = nnx.Optimizer(main_net, optax.adam(1e-4), wrt=nnx.Param)
     return {
         'key': jrd.key(int(random() * 1e12)),
         'replay_buffer': get_replay_buffer(
@@ -358,22 +458,9 @@ def get_state(buffer_length, max_episode_length, obs_shape, num_actions):
         'main_net': main_net,
         'target_net': target_net,
         'num_steps': 0,
-        'main_optimiser': main_optimiser,
-        'target_optimiser': target_optimiser
+        'optimiser': optimiser,
+        'seq_len': 2
     }
-
-
-@jax.jit
-def train(timestep, state):
-    rb = state['replay_buffer']
-    state['replay_buffer'] = add_timestep(timestep, rb)
-
-    state['key'], subkey = jrd.split(state['key'])
-
-    action = jrd.randint(subkey, (), 0, state['num_actions'])
-
-    batch = get_batch(state)
-    return action, state
 
 
 class Qnet(nnx.Module):
@@ -438,7 +525,7 @@ if __name__ == '__main__':
 
     assert any(rb['terminated'])
 
-    while True:
-        batch = get_batch(agent.state)
-        display_batch(batch)
+    # while True:
+    #     batch = get_batch(agent.state)
+    #     display_batch(batch)
         # input('Press Enter\n')
