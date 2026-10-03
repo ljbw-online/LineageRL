@@ -164,9 +164,10 @@ def add_timestep(timestep, replay_buffer):
 
 @jax.jit
 def get_batch(state):
-    batch_size = 32
-    sequence_length = 2
+    # batch_size = 32
     replay_buffer = state['replay_buffer']
+    batch = replay_buffer['batch']
+    sequence_length = replay_buffer['batch']['action'].shape[1]
 
     add_bounds_index = replay_buffer['add_bounds_index']
     least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
@@ -192,20 +193,20 @@ def get_batch(state):
         % max_episodes
     )
 
-    observation_shape = replay_buffer['observation'].shape[1:]
+    # observation_shape = replay_buffer['observation'].shape[1:]
 
-    obs_batch_shape = (
-        (batch_size,) + observation_shape + (sequence_length,)
-    )
+    # obs_batch_shape = (
+    #     (batch_size,) + observation_shape + (sequence_length,)
+    # )
 
     choice_bounds = replay_buffer['boundaries'][choices]
 
-    batch = {
-        'observation': jnp.zeros(obs_batch_shape, dtype=jnp.uint8),
-        'action': jnp.zeros((batch_size, sequence_length), dtype=jnp.int32),
-        'reward': jnp.zeros((batch_size, sequence_length), dtype=jnp.float32),
-        'terminated': jnp.zeros((batch_size, sequence_length), dtype=jnp.bool)
-    }
+    # batch = {
+    #     'observation': jnp.zeros(obs_batch_shape, dtype=jnp.uint8),
+    #     'action': jnp.zeros((batch_size, sequence_length), dtype=jnp.int32),
+    #     'reward': jnp.zeros((batch_size, sequence_length), dtype=jnp.float32),
+    #     'terminated': jnp.zeros((batch_size, sequence_length), dtype=jnp.bool)
+    # }
 
     for i, bounds in enumerate(choice_bounds):
         lower = bounds[0]
@@ -417,7 +418,9 @@ def train(timestep, state):
     return action, state
 
 
-def get_replay_buffer(buffer_length, max_episode_length, observation_shape):
+def get_replay_buffer(
+    buffer_length, max_episode_length, observation_shape, sequence_length
+):
     observation_buffer_shape = (buffer_length,) + observation_shape
     observation_episode_shape = (max_episode_length,) + observation_shape
     return {
@@ -440,6 +443,14 @@ def get_replay_buffer(buffer_length, max_episode_length, observation_shape):
             'reward': jnp.zeros(max_episode_length, dtype=jnp.float32),
             'terminated': jnp.zeros(max_episode_length, dtype=jnp.bool),
             'step_count': jnp.int32(0),
+        },
+        'batch': {
+            'observation': jnp.zeros(
+                (32,) + observation_shape + (sequence_length,), dtype=jnp.uint8
+            ),
+            'action': jnp.zeros((32, 2), dtype=jnp.int32),
+            'reward': jnp.zeros((32, 2), dtype=jnp.float32),
+            'terminated': jnp.zeros((32, 2), dtype=jnp.bool)
         }
     }
 
@@ -459,7 +470,8 @@ def get_state(buffer_length, max_episode_length, obs_shape, num_actions):
         'target_net': target_net,
         'num_steps': 0,
         'optimiser': optimiser,
-        'seq_len': 2
+        'seq_len': 2,
+        'gamma': 0.99
     }
 
 
@@ -469,9 +481,9 @@ class Qnet(nnx.Module):
         self.linear0 = nnx.Linear(self.size, 128, rngs=rngs)
         self.linear1 = nnx.Linear(128, num_actions, rngs=rngs)
 
-    def __call__(self, obs):
-        obs = obs.reshape(self.size) / 255.0
-        a = self.linear0(obs)
+    def __call__(self, obs_batch):
+        obs_batch = obs_batch.reshape(obs_batch.shape[0], -1) / 255.0
+        a = self.linear0(obs_batch)
         a = nnx.gelu(a)
         a = self.linear1(a)
         return a
