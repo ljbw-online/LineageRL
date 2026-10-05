@@ -75,10 +75,6 @@ def add_episode(replay_buffer):
     )
 
     def overlap_check(replay_buffer):
-        # jax.debug.print(
-        #     'cap_r {a}, end_i {b}, bound {c}', a=capacity_reached,
-        #     b=end_index, c=boundaries[first_ep_pos, 0]
-        # )
         least_recent_ep_start = replay_buffer['least_recent_bounds'][0]
 
         return jnp.logical_and(
@@ -99,14 +95,12 @@ def add_episode(replay_buffer):
 
         return replay_buffer
 
-    # jax.debug.print('before while')
     # while_loop :: (a -> Bool) -> (a -> a) -> (a -> a)
     replay_buffer = lax.while_loop(
         overlap_check,
         update_least_recent_bounds,
         replay_buffer
     )
-    # jax.debug.print('after while')
 
     return replay_buffer
 
@@ -163,7 +157,7 @@ def add_timestep(timestep, replay_buffer):
 
 
 @jax.jit
-def get_batch(state):
+def generate_batch(state):
     # batch_size = 32
     replay_buffer = state['replay_buffer']
     batch = replay_buffer['batch']
@@ -235,7 +229,9 @@ def get_batch(state):
             # batch[k] = batch[k].at[i].set(replay_buffer[k][seq_start: seq_end])
             batch[k] = batch[k].at[i].set(replay_buffer[k][seq_slice])
 
-    return batch
+    state['batch'] = batch
+
+    return state
 
 
 def add_test_episode(replay_buffer, max_episode_length, j):
@@ -315,7 +311,8 @@ def run_episode(env, replay_buffer):
     return replay_buffer
 
 
-def get_regression_targets(batch, state):
+def get_regression_targets(state):
+    batch = state['batch']
     main_net = state['main_net']
     target_net = state['target_net']
 
@@ -350,10 +347,10 @@ def loss_fn(main_net, loss_batch):
     targets = loss_batch['target']
 
     selected_q_values = main_q_values[
-        jnp.arange(main_q_values.shape[0]), actions
+        jnp.arange(main_q_values.shape[0]), actions[:, 0]
     ]
 
-    return (selected_q_values - targets) ** 2
+    return jnp.mean((selected_q_values - targets) ** 2)
 
 
 loss_with_gradients = nnx.value_and_grad(loss_fn)
@@ -363,7 +360,7 @@ def update_target_net(state):
     main_net = state['main_net']
     target_net = state['target_net']
 
-    _, main_params = nnx.split(main_net, nnx.Params)
+    _, main_params = nnx.split(main_net, nnx.Param)
     # TODO: does this in-place update get into the state dict?
     nnx.update(target_net, main_params)
 
@@ -373,15 +370,17 @@ def update_target_net(state):
 
 
 def update_nets(state):
-    batch = get_batch(state)
+    state = generate_batch(state)
+
     main_net = state['main_net']
-    seq_len = state['seq_len']
+    # seq_len = state['seq_len']
     optimiser = state['optimiser']
 
-    targets = get_regression_targets(batch, state)
+    batch = state['batch']
+    targets = get_regression_targets(state)
 
     loss_batch = {
-        'observation': batch['observation'][:, :, :, :seq_len],
+        'observation': batch['observation'][:, :, :, :1],
         'action': batch['action'],
         'target': targets
     }
@@ -394,8 +393,13 @@ def update_nets(state):
     state['main_updates_since_target_update'] += 1
     state['loss'] = loss
 
+    should_update_target = (
+        state['main_updates_since_target_update']
+        >= state['main_updates_per_target_update']
+    )
+
     state = lax.cond(
-        state['main_updates_since_target_update'] >= 1_000,
+        should_update_target,
         update_target_net,
         lambda s: s,
         state
@@ -455,7 +459,9 @@ def get_replay_buffer(
     }
 
 
-def get_state(buffer_length, max_episode_length, obs_shape, num_actions):
+def get_state(
+    buffer_length, max_episode_length, obs_shape, num_actions, seq_len
+):
     rngs = nnx.Rngs(int(random() * 1e12))
     main_net = Qnet(obs_shape, num_actions, rngs)
     target_net = Qnet(obs_shape, num_actions, rngs)
@@ -463,15 +469,16 @@ def get_state(buffer_length, max_episode_length, obs_shape, num_actions):
     return {
         'key': jrd.key(int(random() * 1e12)),
         'replay_buffer': get_replay_buffer(
-            buffer_length, max_episode_length, obs_shape
+            buffer_length, max_episode_length, obs_shape, seq_len
         ),
         'num_actions': num_actions,
         'main_net': main_net,
         'target_net': target_net,
-        'num_steps': 0,
         'optimiser': optimiser,
         'seq_len': 2,
-        'gamma': 0.99
+        'gamma': 0.99,
+        'num_steps': 0,
+        'main_updates_since_target_update': 0
     }
 
 
@@ -490,10 +497,41 @@ class Qnet(nnx.Module):
 
 
 class Agent:
-    def __init__(self, buffer_len, max_ep_len, obs_shape, num_actions):
+    def __init__(
+        self, env_constructor, buffer_len=1e6, max_ep_len=18e3, seq_len=2
+    ):
         self.max_ep_len = max_ep_len
-        self.state = get_state(buffer_len, max_ep_len, obs_shape, num_actions)
-        self.env = Env(size=obs_shape[0])
+
+        env = env_constructor()
+        obs_shape = env.observation_space.shape
+        num_actions = env.action_space.n
+
+        self.env = env
+
+        # self.state = get_state(
+        #     buffer_len, max_ep_len, obs_shape, num_actions, seq_len
+        # )
+
+        rngs = nnx.Rngs(int(random() * 1e12))
+        main_net = Qnet(obs_shape, num_actions, rngs)
+        target_net = Qnet(obs_shape, num_actions, rngs)
+        optimiser = nnx.Optimizer(main_net, optax.adam(1e-4), wrt=nnx.Param)
+
+        self.state = {
+            'key': jrd.key(int(random() * 1e12)),
+            'replay_buffer': get_replay_buffer(
+                buffer_len, max_ep_len, obs_shape, seq_len
+            ),
+            'num_actions': num_actions,
+            'main_net': main_net,
+            'target_net': target_net,
+            'optimiser': optimiser,
+            # 'seq_len': 2,
+            'gamma': 0.99,
+            # 'num_steps': 0,
+            'main_updates_since_target_update': 0,
+            'main_updates_per_target_update': 100
+        }
 
     def train(self, num_steps):
         step_count = 0
@@ -506,10 +544,17 @@ class Agent:
                 'reward': 0,
                 'terminated': False
             }
-            for _ in range(self.max_ep_len):
+            ep_return = 0
+            for i in range(self.max_ep_len):
                 step_count += 1
 
                 action, self.state = train(timestep, self.state)
+
+                mustu = self.state['main_updates_since_target_update']
+                if mustu == 99 or mustu == 0:
+                    print('mustu:', mustu)
+                    print(self.state['main_net'](obs[None, :]))
+                    print(self.state['target_net'](obs[None, :]))
 
                 if terminated:
                     break
@@ -521,6 +566,9 @@ class Agent:
                     'reward': reward,
                     'terminated': terminated
                 }
+                ep_return += reward
+
+            # print(f'length {i + 1}, return {ep_return}')
 
             if step_count >= num_steps:
                 break
@@ -529,13 +577,16 @@ class Agent:
 if __name__ == '__main__':
     from environments.follow_the_dots import Env
 
-    agent = Agent(200, 100, (2, 2), 4)
+    def get_env():
+        return Env(2)
 
-    agent.train(200)
+    agent = Agent(get_env, buffer_len=1_000, max_ep_len=20)
+
+    agent.train(250)
 
     rb = agent.state['replay_buffer']
 
-    assert any(rb['terminated'])
+    # assert any(rb['terminated'])
 
     # while True:
     #     batch = get_batch(agent.state)

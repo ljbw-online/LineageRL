@@ -1,4 +1,5 @@
 import numpy as np
+from gymnasium.spaces import Box, Discrete
 
 rng = np.random.default_rng()
 
@@ -15,6 +16,9 @@ class Env:
         self.y = 0
 
         self.dot_xs = rng.integers(size, size=size)
+
+        self.observation_space = Box(0, 255, (size, size), np.uint8)
+        self.action_space = Discrete(4)
 
     def reset(self):
         self.x = 0
