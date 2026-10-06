@@ -408,11 +408,41 @@ def update_nets(state):
     return state
 
 
+def get_action(obs, state):
+    main_net = state['main_net']
+    epsilon_interval = state['epsilon_interval']
+    observations_collected = state['observations_collected']
+
+    interval_progress = jnp.minimum(
+        observations_collected / epsilon_interval, 1
+    )
+
+    epsilon = 1 - interval_progress * state['epsilon_range']
+
+    state['key'], subkey0, subkey1 = jrd.split(state['key'], num=3)
+
+    take_random_action = jrd.uniform(subkey0) < epsilon
+
+    action = jnp.where(
+        take_random_action,
+        jnp.argmax(main_net(obs[None, :])),
+        jrd.randint(subkey1, (), 0, state['num_actions'])
+    )
+
+    state['observations_collected'] = observations_collected + 1
+
+    state['took_rand_act'] = take_random_action
+
+    return action, state
+
+
 @jax.jit
 def train(timestep, state):
-    state['key'], subkey = jrd.split(state['key'])
+    # state['key'], subkey = jrd.split(state['key'])
     # TODO: epsilon-greedy
-    action = jrd.randint(subkey, (), 0, state['num_actions'])
+    # action = jrd.randint(subkey, (), 0, state['num_actions'])
+
+    action, state = get_action(timestep['observation'], state)
 
     rb = state['replay_buffer']
     state['replay_buffer'] = add_timestep(timestep, rb)
@@ -459,27 +489,27 @@ def get_replay_buffer(
     }
 
 
-def get_state(
-    buffer_length, max_episode_length, obs_shape, num_actions, seq_len
-):
-    rngs = nnx.Rngs(int(random() * 1e12))
-    main_net = Qnet(obs_shape, num_actions, rngs)
-    target_net = Qnet(obs_shape, num_actions, rngs)
-    optimiser = nnx.Optimizer(main_net, optax.adam(1e-4), wrt=nnx.Param)
-    return {
-        'key': jrd.key(int(random() * 1e12)),
-        'replay_buffer': get_replay_buffer(
-            buffer_length, max_episode_length, obs_shape, seq_len
-        ),
-        'num_actions': num_actions,
-        'main_net': main_net,
-        'target_net': target_net,
-        'optimiser': optimiser,
-        'seq_len': 2,
-        'gamma': 0.99,
-        'num_steps': 0,
-        'main_updates_since_target_update': 0
-    }
+# def get_state(
+#     buffer_length, max_episode_length, obs_shape, num_actions, seq_len
+# ):
+#     rngs = nnx.Rngs(int(random() * 1e12))
+#     main_net = Qnet(obs_shape, num_actions, rngs)
+#     target_net = Qnet(obs_shape, num_actions, rngs)
+#     optimiser = nnx.Optimizer(main_net, optax.adam(1e-4), wrt=nnx.Param)
+#     return {
+#         'key': jrd.key(int(random() * 1e12)),
+#         'replay_buffer': get_replay_buffer(
+#             buffer_length, max_episode_length, obs_shape, seq_len
+#         ),
+#         'num_actions': num_actions,
+#         'main_net': main_net,
+#         'target_net': target_net,
+#         'optimiser': optimiser,
+#         'seq_len': 2,
+#         'gamma': 0.99,
+#         'num_steps': 0,
+#         'main_updates_since_target_update': 0
+#     }
 
 
 class Qnet(nnx.Module):
@@ -498,7 +528,8 @@ class Qnet(nnx.Module):
 
 class Agent:
     def __init__(
-        self, env_constructor, buffer_len=1e6, max_ep_len=18e3, seq_len=2
+        self, env_constructor, buffer_len=1e6, max_ep_len=18e3, seq_len=2,
+        min_epsilon=0.1
     ):
         self.max_ep_len = max_ep_len
 
@@ -530,7 +561,11 @@ class Agent:
             'gamma': 0.99,
             # 'num_steps': 0,
             'main_updates_since_target_update': 0,
-            'main_updates_per_target_update': 100
+            'main_updates_per_target_update': 100,
+            'epsilon_range': 1 - min_epsilon,
+            'epsilon_interval': 1_000,
+            'observations_collected': 0,
+            'took_rand_act': False,
         }
 
     def train(self, num_steps):
@@ -545,16 +580,13 @@ class Agent:
                 'terminated': False
             }
             ep_return = 0
+            rand_act_count = 0
             for i in range(self.max_ep_len):
                 step_count += 1
 
                 action, self.state = train(timestep, self.state)
 
-                mustu = self.state['main_updates_since_target_update']
-                if mustu == 99 or mustu == 0:
-                    print('mustu:', mustu)
-                    print(self.state['main_net'](obs[None, :]))
-                    print(self.state['target_net'](obs[None, :]))
+                rand_act_count += int(self.state['took_rand_act'])
 
                 if terminated:
                     break
@@ -568,7 +600,8 @@ class Agent:
                 }
                 ep_return += reward
 
-            # print(f'length {i + 1}, return {ep_return}')
+            print(f'length {i + 1:3}, return {ep_return}')
+            # print(f'{round((rand_act_count / (i + 1)) * 100)}% of actions were random')
 
             if step_count >= num_steps:
                 break
@@ -580,9 +613,9 @@ if __name__ == '__main__':
     def get_env():
         return Env(2)
 
-    agent = Agent(get_env, buffer_len=1_000, max_ep_len=20)
+    agent = Agent(get_env, buffer_len=1_000, max_ep_len=100)
 
-    agent.train(250)
+    agent.train(10_000)
 
     rb = agent.state['replay_buffer']
 
