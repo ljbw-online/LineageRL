@@ -39,6 +39,8 @@ def add_episode(replay_buffer):
 
     length = replay_buffer['episode']['step_count']
 
+    replay_buffer['timesteps_stored'] += length
+
     boundaries = replay_buffer['boundaries']
     add_bounds_index = replay_buffer['add_bounds_index']
     start_index = replay_buffer['add_episode_index']
@@ -83,12 +85,15 @@ def add_episode(replay_buffer):
         )
 
     def update_least_recent_bounds(replay_buffer):
-        boundaries = replay_buffer['boundaries']
-        least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
-
         least_recent_bounds, least_recent_bounds_index = circular_get(
-            boundaries, least_recent_bounds_index
+            replay_buffer['boundaries'],
+            replay_buffer['least_recent_bounds_index']
         )
+
+        start = least_recent_bounds[0]
+        end = least_recent_bounds[1]
+
+        replay_buffer['timesteps_stored'] -= end - start
 
         replay_buffer['least_recent_bounds'] = least_recent_bounds
         replay_buffer['least_recent_bounds_index'] = least_recent_bounds_index
@@ -101,6 +106,46 @@ def add_episode(replay_buffer):
         update_least_recent_bounds,
         replay_buffer
     )
+
+    add_bounds_index = replay_buffer['add_bounds_index']
+    least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
+    timesteps_stored = replay_buffer['timesteps_stored']
+    probs = replay_buffer['episode_probabilities']
+
+    bounds_wrapped = add_bounds_index < least_recent_bounds_index
+
+    for i, bounds in enumerate(boundaries):
+        start = bounds[0]
+        end = bounds[1]
+
+        # Is the current index inside or outside the circular segment
+        # containing the active episode boundaries.
+        inside = jnp.logical_and(
+            i > least_recent_bounds_index, i < add_bounds_index
+        )
+
+        outside = jnp.logical_or(
+            i < add_bounds_index, i > least_recent_bounds_index
+        )
+
+        # inside = i > least_recent_bounds_index and i < add_bounds_index
+        # outside = i < add_bounds_index or i > least_recent_bounds_index
+
+        set_prob = jnp.logical_or(
+            jnp.logical_and(jnp.logical_not(bounds_wrapped), inside),
+            jnp.logical_and(bounds_wrapped, outside)
+        )
+
+        # set_prob = (
+        #     (not bounds_wrapped and inside)
+        #     or (bounds_wrapped and outside)
+        # )
+
+        prob = jnp.where(set_prob, (end - start) / timesteps_stored, 0)
+
+        probs = probs.at[i].set(prob)
+
+    replay_buffer['episode_probabilities'] = probs
 
     return replay_buffer
 
@@ -161,46 +206,41 @@ def generate_batch(state):
     # batch_size = 32
     replay_buffer = state['replay_buffer']
     batch = replay_buffer['batch']
+    batch_size = replay_buffer['batch']['action'].shape[0]
     sequence_length = replay_buffer['batch']['action'].shape[1]
 
-    add_bounds_index = replay_buffer['add_bounds_index']
-    least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
-    max_episodes = replay_buffer['boundaries'].shape[0]
+    # add_bounds_index = replay_buffer['add_bounds_index']
+    # least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
+    # max_episodes = replay_buffer['boundaries'].shape[0]
 
     # Using the mod operator makes this correct even when
     # add_bounds_index < least_recent_bounds_index.
     # This isn't correct if both of them are zero, but that isn't possible
     # when the number of bounds is equal to the buffer length and the
     # shortest episode is two timesteps.
-    num_stored_episodes = (
-        (add_bounds_index - least_recent_bounds_index) % max_episodes
-    )
+    # num_stored_episodes = (
+    #     (add_bounds_index - least_recent_bounds_index) % max_episodes
+    # )
 
     state['key'], subkey = jrd.split(state['key'])
 
     # TODO: sample episodes with probability proportional to their length!
 
     # Episode choices, using randint because jrd.choice doesn't like tracers.
-    choices = (
-        (jrd.randint(subkey, (32,), 0, num_stored_episodes)
-            + least_recent_bounds_index)
-        % max_episodes
-    )
-
-    # observation_shape = replay_buffer['observation'].shape[1:]
-
-    # obs_batch_shape = (
-    #     (batch_size,) + observation_shape + (sequence_length,)
+    # choices = (
+    #     (jrd.randint(subkey, (32,), 0, num_stored_episodes)
+    #         + least_recent_bounds_index)
+    #     % max_episodes
     # )
 
-    choice_bounds = replay_buffer['boundaries'][choices]
+    # choice_bounds = replay_buffer['boundaries'][choices]
 
-    # batch = {
-    #     'observation': jnp.zeros(obs_batch_shape, dtype=jnp.uint8),
-    #     'action': jnp.zeros((batch_size, sequence_length), dtype=jnp.int32),
-    #     'reward': jnp.zeros((batch_size, sequence_length), dtype=jnp.float32),
-    #     'terminated': jnp.zeros((batch_size, sequence_length), dtype=jnp.bool)
-    # }
+    boundaries = replay_buffer['boundaries']
+    sample_probs = replay_buffer['episode_probabilities']
+
+    choice_bounds = jrd.choice(
+        subkey, boundaries, shape=(batch_size,), p=sample_probs
+    )
 
     for i, bounds in enumerate(choice_bounds):
         lower = bounds[0]
@@ -211,11 +251,11 @@ def generate_batch(state):
         # TODO: ensure sequences ending before t=seq_len get into batches
 
         state['key'], subkey = jrd.split(state['key'])
-        # seq_start = jrd.choice(subkey, ep_len - sequence_length + 1)
         seq_start = jrd.randint(subkey, (), 0, ep_len - sequence_length + 1)
-        # seq_end = seq_start + sequence_length
 
-        seq_slice = jax.ds(seq_start, sequence_length)
+        seq_start_index = lower + seq_start
+
+        seq_slice = jax.ds(seq_start_index, sequence_length)
 
         # Return observations channels-last
         batch['observation'] = batch['observation'].at[i].set(
@@ -226,7 +266,6 @@ def generate_batch(state):
         )
 
         for k in ['action', 'reward', 'terminated']:
-            # batch[k] = batch[k].at[i].set(replay_buffer[k][seq_start: seq_end])
             batch[k] = batch[k].at[i].set(replay_buffer[k][seq_slice])
 
     state['batch'] = batch
@@ -463,6 +502,8 @@ def get_replay_buffer(
         'reward': jnp.zeros(buffer_length, dtype=jnp.float32),
         'terminated': jnp.zeros(buffer_length, dtype=jnp.bool),
         'boundaries': jnp.zeros((buffer_length, 2), dtype=jnp.int32),
+        'episode_probabilities': jnp.zeros(buffer_length, dtype=jnp.float32),
+        'timesteps_stored': jnp.int32(0),
         'add_bounds_index': jnp.int32(0),
         'least_recent_bounds_index': jnp.int32(0),
         'least_recent_bounds': jnp.zeros(2, dtype=jnp.int32),
