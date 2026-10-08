@@ -24,11 +24,6 @@ def write_timestep(i, data):
             replay_buffer['episode'][key][i]
         )
 
-    # jax.debug.print(
-    #     'i={x}, act={y}', x=i,
-    #     y=replay_buffer['episode']['action'][i]
-    # )
-
     # We have to return buffer_offset because a loop body has to return
     # something with the same pytree structure as what it receives.
     return replay_buffer, buffer_offset
@@ -203,7 +198,6 @@ def add_timestep(timestep, replay_buffer):
 
 @jax.jit
 def generate_batch(state):
-    # batch_size = 32
     replay_buffer = state['replay_buffer']
     batch = replay_buffer['batch']
     batch_size = replay_buffer['batch']['action'].shape[0]
@@ -273,34 +267,10 @@ def generate_batch(state):
     return state
 
 
-def add_test_episode(replay_buffer, max_episode_length, j):
-    if j > max_episode_length:
-        raise ValueError
+def test_replay_buffer():
+    from environments.replay_test import Env
 
-    for i in range(1, j + 1):
-        if j == max_episode_length:
-            # Truncated episode
-            term = i == j - 1 and random() < 0.5
-        else:
-            term = i == j - 1
-
-        ts = {
-            'observation': jnp.uint8(j ** i),
-            'action': jnp.uint8(j ** i),
-            'reward': jnp.float32(j ** i),
-            'terminated': jnp.bool(term),
-        }
-
-        replay_buffer = add_timestep(ts, replay_buffer)
-
-    return replay_buffer
-
-
-def add_random_test_episode(replay_buffer, max_episode_length):
-    # Randint is inclusive of the upper bound
-    j = randint(2, max_episode_length)
-
-    return add_test_episode(replay_buffer, max_episode_length, j)
+    agent = Agent(Env, buffer_len=1_000, max_ep_len=256)
 
 
 def display_batch(batch):
@@ -477,14 +447,9 @@ def get_action(obs, state):
 
 @jax.jit
 def train(timestep, state):
-    # state['key'], subkey = jrd.split(state['key'])
-    # TODO: epsilon-greedy
-    # action = jrd.randint(subkey, (), 0, state['num_actions'])
-
     action, state = get_action(timestep['observation'], state)
 
-    rb = state['replay_buffer']
-    state['replay_buffer'] = add_timestep(timestep, rb)
+    state['replay_buffer'] = add_timestep(timestep, state['replay_buffer'])
 
     state = update_nets(state)
 
@@ -580,10 +545,6 @@ class Agent:
 
         self.env = env
 
-        # self.state = get_state(
-        #     buffer_len, max_ep_len, obs_shape, num_actions, seq_len
-        # )
-
         rngs = nnx.Rngs(int(random() * 1e12))
         main_net = Qnet(obs_shape, num_actions, rngs)
         target_net = Qnet(obs_shape, num_actions, rngs)
@@ -598,9 +559,7 @@ class Agent:
             'main_net': main_net,
             'target_net': target_net,
             'optimiser': optimiser,
-            # 'seq_len': 2,
             'gamma': 0.99,
-            # 'num_steps': 0,
             'main_updates_since_target_update': 0,
             'main_updates_per_target_update': 100,
             'epsilon_range': 1 - min_epsilon,
@@ -659,10 +618,3 @@ if __name__ == '__main__':
     agent.train(10_000)
 
     rb = agent.state['replay_buffer']
-
-    # assert any(rb['terminated'])
-
-    # while True:
-    #     batch = get_batch(agent.state)
-    #     display_batch(batch)
-        # input('Press Enter\n')
