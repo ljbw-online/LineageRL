@@ -270,7 +270,27 @@ def generate_batch(state):
 def test_replay_buffer():
     from environments.replay_test import Env
 
-    agent = Agent(Env, buffer_len=1_000, max_ep_len=256)
+    agent = Agent(Env, buffer_len=210, max_ep_len=256)
+
+    timestep = {
+        'observation': agent.env.reset(100)[0], 'action': 0, 'reward': 0,
+        'terminated': False
+    }
+
+    agent.run_episode(timestep)
+
+    agent.log()
+
+    timestep['observation'] = agent.env.reset(60)[0]
+    agent.run_episode(timestep)
+    agent.log()
+
+    num_ts = agent.state['replay_buffer']['timesteps_stored']
+
+    print('act')
+    print(agent.state['replay_buffer']['action'])
+
+    assert num_ts == 160, num_ts
 
 
 def display_batch(batch):
@@ -421,12 +441,15 @@ def get_action(obs, state):
     main_net = state['main_net']
     epsilon_interval = state['epsilon_interval']
     observations_collected = state['observations_collected']
+    evaluating = state['evaluating']
 
     interval_progress = jnp.minimum(
         observations_collected / epsilon_interval, 1
     )
 
     epsilon = 1 - interval_progress * state['epsilon_range']
+
+    epsilon = epsilon * jnp.float32(jnp.logical_not(evaluating))
 
     state['key'], subkey0, subkey1 = jrd.split(state['key'], num=3)
 
@@ -439,8 +462,6 @@ def get_action(obs, state):
     )
 
     state['observations_collected'] = observations_collected + 1
-
-    state['took_rand_act'] = take_random_action
 
     return action, state
 
@@ -495,29 +516,6 @@ def get_replay_buffer(
     }
 
 
-# def get_state(
-#     buffer_length, max_episode_length, obs_shape, num_actions, seq_len
-# ):
-#     rngs = nnx.Rngs(int(random() * 1e12))
-#     main_net = Qnet(obs_shape, num_actions, rngs)
-#     target_net = Qnet(obs_shape, num_actions, rngs)
-#     optimiser = nnx.Optimizer(main_net, optax.adam(1e-4), wrt=nnx.Param)
-#     return {
-#         'key': jrd.key(int(random() * 1e12)),
-#         'replay_buffer': get_replay_buffer(
-#             buffer_length, max_episode_length, obs_shape, seq_len
-#         ),
-#         'num_actions': num_actions,
-#         'main_net': main_net,
-#         'target_net': target_net,
-#         'optimiser': optimiser,
-#         'seq_len': 2,
-#         'gamma': 0.99,
-#         'num_steps': 0,
-#         'main_updates_since_target_update': 0
-#     }
-
-
 class Qnet(nnx.Module):
     def __init__(self, obs_shape, num_actions, rngs):
         self.size = obs_shape[0] * obs_shape[1]
@@ -537,7 +535,9 @@ class Agent:
         self, env_constructor, buffer_len=1e6, max_ep_len=18e3, seq_len=2,
         min_epsilon=0.1
     ):
+        self.log_items = {}
         self.max_ep_len = max_ep_len
+        self.total_steps = 0
 
         env = env_constructor()
         obs_shape = env.observation_space.shape
@@ -565,56 +565,90 @@ class Agent:
             'epsilon_range': 1 - min_epsilon,
             'epsilon_interval': 1_000,
             'observations_collected': 0,
-            'took_rand_act': False,
+            'evaluating': False,
         }
 
     def train(self, num_steps):
-        step_count = 0
+        initial_total_steps = self.total_steps
         while True:
-            obs, _ = self.env.reset()
-            terminated = False
-            timestep = {
-                'observation': obs,
-                'action': 0,
-                'reward': 0,
-                'terminated': False
-            }
-            ep_return = 0
-            rand_act_count = 0
-            for i in range(self.max_ep_len):
-                step_count += 1
+            timestep = self.get_initial_timestep()
+            self.run_episode(timestep)
 
-                action, self.state = train(timestep, self.state)
+            self.log()
 
-                rand_act_count += int(self.state['took_rand_act'])
-
-                if terminated:
-                    break
-
-                obs_next, reward, terminated, _, _ = self.env.step(action)
-                timestep = {
-                    'observation': obs_next,
-                    'action': action,
-                    'reward': reward,
-                    'terminated': terminated
-                }
-                ep_return += reward
-
-            print(f'length {i + 1:3}, return {ep_return}')
-            # print(f'{round((rand_act_count / (i + 1)) * 100)}% of actions were random')
-
-            if step_count >= num_steps:
+            if self.total_steps >= initial_total_steps + num_steps:
                 break
+
+    def get_initial_timestep(self):
+        obs, _ = self.env.reset()
+        return {
+            'observation': obs, 'action': 0, 'reward': 0,
+            'terminated': False
+        }
+
+    def run_episode(self, timestep, evaluating=False):
+        terminated = False
+        episode_return = 0
+        for i in range(self.max_ep_len):
+            action, self.state = train(timestep, self.state)
+
+            if terminated:
+                break
+
+            obs_next, reward, terminated, _, _ = self.env.step(action)
+
+            timestep = {
+                'observation': obs_next, 'action': action,
+                'reward': reward, 'terminated': terminated
+            }
+
+            episode_return += reward
+
+        self.total_steps += i + 1
+
+        self.log_items['length'] = f'{i + 1:3}'
+        self.log_items['return'] = f'{episode_return}'
+
+        if evaluating:
+            return episode_return
+
+    def evaluate(self, num_episodes):
+        self.state['evaluating'] = True
+        total_return = 0
+
+        for _ in range(num_episodes):
+            timestep = self.get_initial_timestep()
+            total_return += self.run_episode(timestep, evaluating=True)
+
+        self.state['evaluating'] = False
+
+        return total_return / num_episodes
+
+    def log(self):
+        log_item_strings = [
+            key + ' ' + value for key, value in self.log_items.items()
+        ]
+        print(', '.join(log_item_strings))
 
 
 if __name__ == '__main__':
+    test_replay_buffer()
+    exit()
     from environments.follow_the_dots import Env
 
     def get_env():
-        return Env(2)
+        return Env(3)
 
-    agent = Agent(get_env, buffer_len=1_000, max_ep_len=100)
+    agent = Agent(get_env, buffer_len=10_000, max_ep_len=100)
 
-    agent.train(10_000)
+    num_eval_episodes = 40
+    while True:
+        agent.train(1_000)
 
-    rb = agent.state['replay_buffer']
+        average_eval_return = agent.evaluate(num_eval_episodes)
+
+        print(f'eval return {average_eval_return:.3}')
+
+        if average_eval_return > (num_eval_episodes - 1) / num_eval_episodes:
+            print('env solved')
+            break
