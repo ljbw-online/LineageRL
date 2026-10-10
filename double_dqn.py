@@ -167,20 +167,29 @@ def add_timestep_to_episode(timestep, episode):
 
 @jax.jit
 def add_timestep(timestep, replay_buffer):
-    # Record whether we got terminated on the previous step
     episode = replay_buffer['episode']
-    # Jax clamps too-large indices but wraps negative indices
+
+    # Jax clamps too-large indices but wraps negative indices. Calculate this
+    # before step_count gets incremented.
     prev_term_index = jnp.maximum(0, episode['step_count'] - 1)
-    terminated = episode['terminated'][prev_term_index]
 
     # Increments step_count
     episode = add_timestep_to_episode(timestep, episode)
+
+    # jax.debug.print(
+    #     'prev_term_index: {a}, terminated: {b}',
+    #     a=prev_term_index, b=episode['terminated'][prev_term_index]
+    # )
+
+    # jax.debug.print('prev obs: {a}', a=episode['observation'][prev_term_index])
+    # jax.debug.print('prev act: {a}', a=episode['action'][prev_term_index])
+    # jax.debug.print('prev rew: {a}', a=episode['reward'][prev_term_index])
 
     # We reached the max episode length or we got terminated on the previous
     # step.
     should_add_episode = jnp.logical_or(
         episode['step_count'] == replay_buffer['max_episode_length'],
-        terminated
+        episode['terminated'][prev_term_index]
     )
 
     replay_buffer = lax.cond(
@@ -273,15 +282,25 @@ def test_replay_buffer():
     agent = Agent(Env, buffer_len=210, max_ep_len=256)
 
     timestep = {
-        'observation': agent.env.reset(100)[0], 'action': 0, 'reward': 0,
-        'terminated': False
+        'observation': agent.env.reset(length=100)[0], 'action': 0,
+        'reward': 0, 'terminated': False
     }
 
     agent.run_episode(timestep)
 
+    # ep = agent.state['replay_buffer']['episode']
+
+    # ts = list(zip(ep['observation'], ep['action'], ep['reward'], ep['terminated']))[:10]
+
+    # for obs, act, rew, ter in ts:
+    #     print(obs)
+    #     print(act, rew, ter)
+
+    # return
+
     agent.log()
 
-    timestep['observation'] = agent.env.reset(60)[0]
+    timestep['observation'] = agent.env.reset(length=60)[0]
     agent.run_episode(timestep)
     agent.log()
 
@@ -457,8 +476,8 @@ def get_action(obs, state):
 
     action = jnp.where(
         take_random_action,
-        jnp.argmax(main_net(obs[None, :])),
-        jrd.randint(subkey1, (), 0, state['num_actions'])
+        jrd.randint(subkey1, (), 0, state['num_actions']),
+        jnp.argmax(main_net(obs[None, :]))
     )
 
     state['observations_collected'] = observations_collected + 1
@@ -632,14 +651,14 @@ class Agent:
 
 
 if __name__ == '__main__':
-    test_replay_buffer()
-    exit()
+    # test_replay_buffer()
+    # exit()
     from environments.follow_the_dots import Env
 
     def get_env():
         return Env(3)
 
-    agent = Agent(get_env, buffer_len=10_000, max_ep_len=100)
+    agent = Agent(get_env, buffer_len=1_000, max_ep_len=100)
 
     num_eval_episodes = 40
     while True:

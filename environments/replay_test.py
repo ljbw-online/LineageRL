@@ -55,11 +55,11 @@ class Env:
 if __name__ == '__main__':
     env = Env()
 
-    print(env.reset())
+    print(env.reset(length=5))
 
     while True:
         obs, reward, term, _, _ = env.step(int(input('action: ')))
         print(obs, reward, term)
         if term:
             print('reset')
-            print(env.reset())
+            print(env.reset(length=7))
