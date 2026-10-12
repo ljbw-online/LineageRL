@@ -113,14 +113,18 @@ def add_episode(replay_buffer):
         start = bounds[0]
         end = bounds[1]
 
-        # Is the current index inside or outside the circular segment
-        # containing the active episode boundaries.
+        # Is the current index inside the slice containing the active episode
+        # boundaries, assuming that the slice hasn't wrapped around to the
+        # beginning of the buffer?
         inside = jnp.logical_and(
-            i > least_recent_bounds_index, i < add_bounds_index
+            i >= least_recent_bounds_index, i < add_bounds_index
         )
 
-        outside = jnp.logical_or(
-            i < add_bounds_index, i > least_recent_bounds_index
+        # Or, if the slice has wrapped, is the index inside one of the slices
+        # that define the circular segment containing the active episode
+        # boundaries?
+        inside_wrapped = jnp.logical_or(
+            i < add_bounds_index, i >= least_recent_bounds_index
         )
 
         # inside = i > least_recent_bounds_index and i < add_bounds_index
@@ -128,7 +132,7 @@ def add_episode(replay_buffer):
 
         set_prob = jnp.logical_or(
             jnp.logical_and(jnp.logical_not(bounds_wrapped), inside),
-            jnp.logical_and(bounds_wrapped, outside)
+            jnp.logical_and(bounds_wrapped, inside_wrapped)
         )
 
         # set_prob = (
@@ -227,17 +231,6 @@ def generate_batch(state):
 
     state['key'], subkey = jrd.split(state['key'])
 
-    # TODO: sample episodes with probability proportional to their length!
-
-    # Episode choices, using randint because jrd.choice doesn't like tracers.
-    # choices = (
-    #     (jrd.randint(subkey, (32,), 0, num_stored_episodes)
-    #         + least_recent_bounds_index)
-    #     % max_episodes
-    # )
-
-    # choice_bounds = replay_buffer['boundaries'][choices]
-
     boundaries = replay_buffer['boundaries']
     sample_probs = replay_buffer['episode_probabilities']
 
@@ -277,6 +270,7 @@ def generate_batch(state):
 
 
 def test_replay_buffer():
+    from collections import defaultdict
     from environments.replay_test import Env
 
     agent = Agent(Env, buffer_len=210, max_ep_len=256)
@@ -288,28 +282,101 @@ def test_replay_buffer():
 
     agent.run_episode(timestep)
 
-    # ep = agent.state['replay_buffer']['episode']
-
-    # ts = list(zip(ep['observation'], ep['action'], ep['reward'], ep['terminated']))[:10]
-
-    # for obs, act, rew, ter in ts:
-    #     print(obs)
-    #     print(act, rew, ter)
-
-    # return
-
     agent.log()
 
     timestep['observation'] = agent.env.reset(length=60)[0]
     agent.run_episode(timestep)
     agent.log()
 
+    timestep['observation'] = agent.env.reset(length=40)[0]
+    agent.run_episode(timestep)
+    agent.log()
+
     num_ts = agent.state['replay_buffer']['timesteps_stored']
 
-    print('act')
-    print(agent.state['replay_buffer']['action'])
+    assert num_ts == 200, num_ts
 
-    assert num_ts == 160, num_ts
+    # We count the first timestep, which means that the last timestep of each
+    # episode won't get counted.
+    all_index_pairs = (
+        [(0, i) for i in range(99)]
+        + [(1, i) for i in range(59)]
+        + [(2, i) for i in range(39)]
+    )
+
+    pair_counts = defaultdict(int)
+
+    counter = 0
+    second_term = False
+    while not (second_term and sorted(pair_counts.keys()) == all_index_pairs):
+        agent.state = generate_batch(agent.state)
+        batch = agent.state['replay_buffer']['batch']
+
+        print(counter)
+        counter += 1
+        for i, action_pair in enumerate(batch['action']):
+            frame0 = batch['observation'][i, :, :, 0]
+            frame1 = batch['observation'][i, :, :, 1]
+
+            frame0_sum_gt_zero = frame0[0, 0] + frame0[0, 1] + frame0[1, 1] > 0
+
+            # First frame data shouldn't all be zero, except for on the very
+            # first frame, which we demark with a bottom-left value of 255.
+            assert frame0_sum_gt_zero or frame0[1, 0] == 255
+
+            # Second frame should never sum to zero
+            assert jnp.sum(frame1) > 0
+
+            # Both frames come from the same episode
+            assert frame0[0, 0] == frame1[0, 0]
+
+            # Second frame follows the first in its corresponding episode
+            assert frame1[0, 1] == frame0[0, 1] + 1
+
+            # Action we took in response to frame0 appears in frame1
+            assert frame1[1, 0] == action_pair[0]
+
+            term_pair = batch['terminated'][i]
+
+            # Are the frames from the penultimate timesteps of any of
+            # the three episodes written so far?
+            f0_penult_0 = list(frame0[0]) == [0, 98]
+            f0_penult_1 = list(frame0[0]) == [1, 58]
+            f0_penult_2 = list(frame0[0]) == [2, 38]
+
+            f1_penult_0 = list(frame1[0]) == [0, 98]
+            f1_penult_1 = list(frame1[0]) == [1, 58]
+            f1_penult_2 = list(frame1[0]) == [2, 38]
+
+            penultimate_frame0 = f0_penult_0 or f0_penult_1 or f0_penult_2
+            penultimate_frame1 = f1_penult_0 or f1_penult_1 or f1_penult_2
+
+            # If frame0 is penultimate then its term value should be True,
+            # otherwise it should False.
+            assert (
+                (penultimate_frame0 and term_pair[0])
+                or (not penultimate_frame0 and not term_pair[0])
+            ), (frame0[0, 1], term_pair[0])
+
+            # Same for frame1
+            assert (
+                (penultimate_frame1 and term_pair[1])
+                or (not penultimate_frame1 and not term_pair[1])
+            ), (frame1[0, 1], term_pair[1])
+
+            second_term = second_term or term_pair[1]
+
+            pair_counts[(int(frame0[0, 0]), int(frame0[0, 1]))] += 1
+
+    print(sorted(pair_counts.keys()))
+    print()
+    print(all_index_pairs)
+    print()
+    print(agent.state['replay_buffer']['observation'][:, 0, 0])
+    print(agent.state['replay_buffer']['boundaries'])
+    print(agent.state['replay_buffer']['episode_probabilities'])
+
+    print('assertions passed')
 
 
 def display_batch(batch):
@@ -651,8 +718,8 @@ class Agent:
 
 
 if __name__ == '__main__':
-    # test_replay_buffer()
-    # exit()
+    test_replay_buffer()
+    exit()
     from environments.follow_the_dots import Env
 
     def get_env():
