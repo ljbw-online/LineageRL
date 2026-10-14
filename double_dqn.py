@@ -269,8 +269,130 @@ def generate_batch(state):
     return state
 
 
-def test_replay_buffer():
+def verify_batch_generation(ep_num_length_pairs, agent):
     from collections import defaultdict
+
+    # all_index_pairs = (
+    #     [(0, i) for i in range(99)]
+    #     + [(1, i) for i in range(59)]
+    #     + [(2, i) for i in range(39)]
+    # )
+
+    # We count the first timestep, which means that the last timestep of each
+    # episode doesn't get included in the statistics.
+    all_index_pairs = []
+    for ep_num, length in ep_num_length_pairs:
+        all_index_pairs.extend([(ep_num, i) for i in range(length - 1)])
+
+    pair_counts = defaultdict(int)
+
+    batch_count = 0
+    second_term = False
+    conditions_satisfied = False
+    while not conditions_satisfied:
+        agent.state = generate_batch(agent.state)
+        batch = agent.state['replay_buffer']['batch']
+
+        batch_count += 1
+        for i, action_pair in enumerate(batch['action']):
+            frame0 = batch['observation'][i, :, :, 0]
+            frame1 = batch['observation'][i, :, :, 1]
+
+            frame0_sum_gt_zero = frame0[0, 0] + frame0[0, 1] + frame0[1, 1] > 0
+
+            # First frame data shouldn't all be zero, except for on the very
+            # first frame, which we demark with a bottom-left value of 255.
+            assert frame0_sum_gt_zero or frame0[1, 0] == 255
+
+            # Second frame should never sum to zero
+            assert jnp.sum(frame1) > 0
+
+            # Both frames come from the same episode
+            assert frame0[0, 0] == frame1[0, 0]
+
+            # Second frame follows the first in its corresponding episode
+            assert frame1[0, 1] == frame0[0, 1] + 1
+
+            # Action we took in response to frame0 appears in frame1
+            assert frame1[1, 0] == action_pair[0]
+
+            term_pair = batch['terminated'][i]
+
+            # Are either of the frames from the penultimate timestep of one of
+            # the episodes? The -2 is because, for example, step 98 is the
+            # penultimate step of an episode of length 100.
+            penultimate_frame0 = any([
+                list(frame0[0]) == [ep_num, length - 2]
+                for ep_num, length in ep_num_length_pairs
+            ])
+
+            penultimate_frame1 = any([
+                list(frame1[0]) == [ep_num, length - 2]
+                for ep_num, length in ep_num_length_pairs
+            ])
+
+            # penultimate_frame0 = f0_penult_0 or f0_penult_1 or f0_penult_2
+            # penultimate_frame1 = f1_penult_0 or f1_penult_1 or f1_penult_2
+
+            # If frame0 is penultimate then its term value should be True,
+            # otherwise its term value should be False.
+            assert (
+                (penultimate_frame0 and term_pair[0])
+                or (not penultimate_frame0 and not term_pair[0])
+            ), (frame0[0, 1], term_pair[0])
+
+            # Same for frame1
+            assert (
+                (penultimate_frame1 and term_pair[1])
+                or (not penultimate_frame1 and not term_pair[1])
+            ), (frame1[0, 1], term_pair[1])
+
+            # Have we yet seen a second timestep with terminated == True?
+            second_term = second_term or term_pair[1]
+
+            pair_counts[(int(frame0[0, 0]), int(frame0[0, 1]))] += 1
+
+        # Do all episode-timestep index pairs yet appear in our dict?
+        all_pairs_found = sorted(pair_counts.keys()) == all_index_pairs
+
+        ep_0_count = 0
+        ep_1_count = 0
+        ep_2_count = 0
+        total = 0
+
+        for (episode_num, step_num), count in pair_counts.items():
+            total += count
+            match episode_num:
+                case 0:
+                    ep_0_count += count
+                case 1:
+                    ep_1_count += count
+                case 2:
+                    ep_2_count += count
+
+        ep_0_prop_correct = (ep_0_count / total) - 0.5 < 0.03
+        ep_1_prop_correct = (ep_1_count / total) - 0.3 < 0.03
+        ep_2_prop_correct = (ep_2_count / total) - 0.2 < 0.03
+
+        # Are timesteps from each episode appearing with a frequency
+        # proportional to the length of the corresponding episode?
+        props_correct = (
+            ep_0_prop_correct and ep_1_prop_correct and ep_2_prop_correct
+        )
+
+        conditions_satisfied = (
+            second_term and all_pairs_found and props_correct
+        )
+
+    ep_0_prop = ep_0_count / total
+    ep_1_prop = ep_1_count / total
+    ep_2_prop = ep_2_count / total
+
+    print(f'{batch_count} batches generated')
+    print(f'Proportions: {ep_0_prop:.2} {ep_1_prop:.2} {ep_2_prop:.2}')
+
+
+def test_replay_buffer():
     from environments.replay_test import Env
 
     agent = Agent(Env, buffer_len=210, max_ep_len=256)
@@ -296,87 +418,31 @@ def test_replay_buffer():
 
     assert num_ts == 200, num_ts
 
-    # We count the first timestep, which means that the last timestep of each
-    # episode won't get counted.
-    all_index_pairs = (
-        [(0, i) for i in range(99)]
-        + [(1, i) for i in range(59)]
-        + [(2, i) for i in range(39)]
-    )
+    verify_batch_generation([(0, 100), (1, 60), (2, 40)], agent)
 
-    pair_counts = defaultdict(int)
+    # TODO: verify exactly full buffer
 
-    counter = 0
-    second_term = False
-    while not (second_term and sorted(pair_counts.keys()) == all_index_pairs):
-        agent.state = generate_batch(agent.state)
-        batch = agent.state['replay_buffer']['batch']
+    timestep = {
+        'observation': agent.env.reset(length=40)[0], 'action': 0,
+        'reward': 0, 'terminated': False
+    }
+    agent.run_episode(timestep)
+    agent.log()
 
-        print(counter)
-        counter += 1
-        for i, action_pair in enumerate(batch['action']):
-            frame0 = batch['observation'][i, :, :, 0]
-            frame1 = batch['observation'][i, :, :, 1]
+    verify_batch_generation([(1, 60), (2, 40), (3, 40)], agent)
 
-            frame0_sum_gt_zero = frame0[0, 0] + frame0[0, 1] + frame0[1, 1] > 0
+    # timestep = {
+    #     'observation': agent.env.reset(length=20)[0], 'action': 0,
+    #     'reward': 0, 'terminated': False
+    # }
+    # agent.run_episode(timestep)
+    # agent.log()
 
-            # First frame data shouldn't all be zero, except for on the very
-            # first frame, which we demark with a bottom-left value of 255.
-            assert frame0_sum_gt_zero or frame0[1, 0] == 255
+    # print(agent.state['replay_buffer']['observation'][20])
+    # print(agent.state['replay_buffer']['least_recent_bounds_index'])
+    # print(agent.state['replay_buffer']['boundaries'])
 
-            # Second frame should never sum to zero
-            assert jnp.sum(frame1) > 0
-
-            # Both frames come from the same episode
-            assert frame0[0, 0] == frame1[0, 0]
-
-            # Second frame follows the first in its corresponding episode
-            assert frame1[0, 1] == frame0[0, 1] + 1
-
-            # Action we took in response to frame0 appears in frame1
-            assert frame1[1, 0] == action_pair[0]
-
-            term_pair = batch['terminated'][i]
-
-            # Are the frames from the penultimate timesteps of any of
-            # the three episodes written so far?
-            f0_penult_0 = list(frame0[0]) == [0, 98]
-            f0_penult_1 = list(frame0[0]) == [1, 58]
-            f0_penult_2 = list(frame0[0]) == [2, 38]
-
-            f1_penult_0 = list(frame1[0]) == [0, 98]
-            f1_penult_1 = list(frame1[0]) == [1, 58]
-            f1_penult_2 = list(frame1[0]) == [2, 38]
-
-            penultimate_frame0 = f0_penult_0 or f0_penult_1 or f0_penult_2
-            penultimate_frame1 = f1_penult_0 or f1_penult_1 or f1_penult_2
-
-            # If frame0 is penultimate then its term value should be True,
-            # otherwise it should False.
-            assert (
-                (penultimate_frame0 and term_pair[0])
-                or (not penultimate_frame0 and not term_pair[0])
-            ), (frame0[0, 1], term_pair[0])
-
-            # Same for frame1
-            assert (
-                (penultimate_frame1 and term_pair[1])
-                or (not penultimate_frame1 and not term_pair[1])
-            ), (frame1[0, 1], term_pair[1])
-
-            second_term = second_term or term_pair[1]
-
-            pair_counts[(int(frame0[0, 0]), int(frame0[0, 1]))] += 1
-
-    print(sorted(pair_counts.keys()))
-    print()
-    print(all_index_pairs)
-    print()
-    print(agent.state['replay_buffer']['observation'][:, 0, 0])
-    print(agent.state['replay_buffer']['boundaries'])
-    print(agent.state['replay_buffer']['episode_probabilities'])
-
-    print('assertions passed')
+    print('Assertions passed')
 
 
 def display_batch(batch):
