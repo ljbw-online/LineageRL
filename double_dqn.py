@@ -8,12 +8,23 @@ from flax import nnx
 import optax
 
 
-def circular_get(buffer, start):
-    return buffer[start], (start + 1) % buffer.shape[0]
+# Returns stale data if we try to get more than we have put.
+def circular_get(buffer, get_index):
+    return buffer[get_index], (get_index + 1) % buffer.shape[0]
 
 
-def circular_put(buffer, end, item):
-    return buffer.at[end].set(item), (end + 1) % buffer.shape[0]
+def circular_put(buffer, get_index, put_index, item):
+    # If we've reached the oldest element of the buffer then we're now
+    # overwriting it so we need to shift get_index along.
+    new_get_index = jnp.where(
+        put_index == get_index,
+        (get_index + 1) % buffer.shape[0],
+        get_index
+    )
+
+    new_put_index = (put_index + 1) % buffer.shape[0]
+
+    return buffer.at[put_index].set(item), new_get_index, new_put_index
 
 
 def write_timestep(i, data):
@@ -29,83 +40,21 @@ def write_timestep(i, data):
     return replay_buffer, buffer_offset
 
 
-def add_episode(replay_buffer):
-    buffer_length = replay_buffer['observation'].shape[0]
-
-    length = replay_buffer['episode']['step_count']
-
-    replay_buffer['timesteps_stored'] += length
-
+def update_episode_probabilities(replay_buffer):
     boundaries = replay_buffer['boundaries']
     add_bounds_index = replay_buffer['add_bounds_index']
-    start_index = replay_buffer['add_episode_index']
-
-    buffer_end_reached = start_index + length > buffer_length
-
-    # If there isn't enough space for the episode at the end of the buffer
-    # then put it at the beginning, otherwise put it directly after the
-    # previous episode.
-    start_index = jnp.where(
-        buffer_end_reached,
-        0,
-        start_index
-    )
-
-    end_index = start_index + length
-
-    boundaries, add_bounds_index = circular_put(
-        boundaries, add_bounds_index, [start_index, end_index]
-    )
-
-    replay_buffer['boundaries'] = boundaries
-    replay_buffer['add_bounds_index'] = add_bounds_index
-    replay_buffer['add_episode_index'] = end_index
-
-    replay_buffer, _ = lax.fori_loop(
-        0, length, write_timestep,
-        (replay_buffer, start_index)
-    )
-
-    # Record whether the buffer capacity has been reached so far
-    replay_buffer['wrapped'] = jnp.logical_or(
-        replay_buffer['wrapped'], buffer_end_reached
-    )
-
-    def overlap_check(replay_buffer):
-        least_recent_ep_start = replay_buffer['least_recent_bounds'][0]
-
-        return jnp.logical_and(
-            replay_buffer['wrapped'],
-            end_index < least_recent_ep_start
-        )
-
-    def update_least_recent_bounds(replay_buffer):
-        least_recent_bounds, least_recent_bounds_index = circular_get(
-            replay_buffer['boundaries'],
-            replay_buffer['least_recent_bounds_index']
-        )
-
-        start = least_recent_bounds[0]
-        end = least_recent_bounds[1]
-
-        replay_buffer['timesteps_stored'] -= end - start
-
-        replay_buffer['least_recent_bounds'] = least_recent_bounds
-        replay_buffer['least_recent_bounds_index'] = least_recent_bounds_index
-
-        return replay_buffer
-
-    # while_loop :: (a -> Bool) -> (a -> a) -> (a -> a)
-    replay_buffer = lax.while_loop(
-        overlap_check,
-        update_least_recent_bounds,
-        replay_buffer
-    )
-
-    add_bounds_index = replay_buffer['add_bounds_index']
-    least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
+    # least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
     timesteps_stored = replay_buffer['timesteps_stored']
     probs = replay_buffer['episode_probabilities']
+
+    # replay_buffer['least_recent_bounds_index'] has been incremented by this
+    # point so the attribute name isn't accurate.
+    # TODO: rename replay_buffer['least_recent_bounds_index'] to something like
+    # boundaries_get_index
+    least_recent_bounds_index = (
+        (replay_buffer['least_recent_bounds_index'] - 1)
+        % replay_buffer['action'].shape[0]
+    )
 
     bounds_wrapped = add_bounds_index < least_recent_bounds_index
 
@@ -127,24 +76,98 @@ def add_episode(replay_buffer):
             i < add_bounds_index, i >= least_recent_bounds_index
         )
 
-        # inside = i > least_recent_bounds_index and i < add_bounds_index
-        # outside = i < add_bounds_index or i > least_recent_bounds_index
-
         set_prob = jnp.logical_or(
             jnp.logical_and(jnp.logical_not(bounds_wrapped), inside),
             jnp.logical_and(bounds_wrapped, inside_wrapped)
         )
-
-        # set_prob = (
-        #     (not bounds_wrapped and inside)
-        #     or (bounds_wrapped and outside)
-        # )
 
         prob = jnp.where(set_prob, (end - start) / timesteps_stored, 0)
 
         probs = probs.at[i].set(prob)
 
     replay_buffer['episode_probabilities'] = probs
+
+    return replay_buffer
+
+
+def add_episode(replay_buffer):
+    buffer_length = replay_buffer['observation'].shape[0]
+
+    length = replay_buffer['episode']['step_count']
+
+    replay_buffer['timesteps_stored'] += length
+
+    boundaries = replay_buffer['boundaries']
+    add_bounds_index = replay_buffer['add_bounds_index']
+    least_recent_bounds_index = replay_buffer['least_recent_bounds_index']
+    start_index = replay_buffer['add_episode_index']
+
+    buffer_end_reached = start_index + length > buffer_length
+
+    # If there isn't enough space for the episode at the end of the buffer
+    # then put it at the beginning, otherwise put it directly after the
+    # previous episode.
+    start_index = jnp.where(
+        buffer_end_reached,
+        0,
+        start_index
+    )
+
+    end_index = start_index + length
+
+    boundaries, least_recent_bounds_index, add_bounds_index = circular_put(
+        boundaries, least_recent_bounds_index, add_bounds_index,
+        [start_index, end_index]
+    )
+
+    replay_buffer['boundaries'] = boundaries
+    replay_buffer['add_bounds_index'] = add_bounds_index
+    replay_buffer['add_episode_index'] = end_index
+
+    replay_buffer, _ = lax.fori_loop(
+        0, length, write_timestep,
+        (replay_buffer, start_index)
+    )
+
+    # Record whether the buffer capacity has been reached so far
+    replay_buffer['wrapped'] = jnp.logical_or(
+        replay_buffer['wrapped'], buffer_end_reached
+    )
+
+    def overlap_check(replay_buffer):
+        least_recent_ep_start = replay_buffer['least_recent_bounds'][0]
+
+        return jnp.logical_and(
+            replay_buffer['wrapped'],
+            end_index > least_recent_ep_start
+        )
+
+    def update_least_recent_bounds(replay_buffer):
+        # Use the current least_recent_bounds to decrement timesteps_stored
+        least_recent_bounds = replay_buffer['least_recent_bounds']
+        start = least_recent_bounds[0]
+        end = least_recent_bounds[1]
+
+        replay_buffer['timesteps_stored'] -= end - start
+
+        least_recent_bounds, least_recent_bounds_index = circular_get(
+            replay_buffer['boundaries'],
+            replay_buffer['least_recent_bounds_index']
+        )
+
+        replay_buffer['least_recent_bounds'] = least_recent_bounds
+        replay_buffer['least_recent_bounds_index'] = least_recent_bounds_index
+
+        return replay_buffer
+
+    # while_loop :: (a -> Bool) -> (a -> a) -> (a -> a)
+    replay_buffer = lax.while_loop(
+        overlap_check,
+        update_least_recent_bounds,
+        replay_buffer
+    )
+
+    replay_buffer = update_episode_probabilities(replay_buffer)
 
     return replay_buffer
 
@@ -179,15 +202,6 @@ def add_timestep(timestep, replay_buffer):
 
     # Increments step_count
     episode = add_timestep_to_episode(timestep, episode)
-
-    # jax.debug.print(
-    #     'prev_term_index: {a}, terminated: {b}',
-    #     a=prev_term_index, b=episode['terminated'][prev_term_index]
-    # )
-
-    # jax.debug.print('prev obs: {a}', a=episode['observation'][prev_term_index])
-    # jax.debug.print('prev act: {a}', a=episode['action'][prev_term_index])
-    # jax.debug.print('prev rew: {a}', a=episode['reward'][prev_term_index])
 
     # We reached the max episode length or we got terminated on the previous
     # step.
@@ -272,12 +286,6 @@ def generate_batch(state):
 def verify_batch_generation(ep_num_length_pairs, agent):
     from collections import defaultdict
 
-    # all_index_pairs = (
-    #     [(0, i) for i in range(99)]
-    #     + [(1, i) for i in range(59)]
-    #     + [(2, i) for i in range(39)]
-    # )
-
     # We count the first timestep, which means that the last timestep of each
     # episode doesn't get included in the statistics.
     all_index_pairs = []
@@ -289,6 +297,7 @@ def verify_batch_generation(ep_num_length_pairs, agent):
     batch_count = 0
     second_term = False
     conditions_satisfied = False
+    iters_since_log = 0
     while not conditions_satisfied:
         agent.state = generate_batch(agent.state)
         batch = agent.state['replay_buffer']['batch']
@@ -370,9 +379,21 @@ def verify_batch_generation(ep_num_length_pairs, agent):
                 case 2:
                     ep_2_count += count
 
-        ep_0_prop_correct = (ep_0_count / total) - 0.5 < 0.03
-        ep_1_prop_correct = (ep_1_count / total) - 0.3 < 0.03
-        ep_2_prop_correct = (ep_2_count / total) - 0.2 < 0.03
+        expected_prop_0 = (
+            (ep_num_length_pairs[0][1] - 1) / len(all_index_pairs)
+        )
+
+        expected_prop_1 = (
+            (ep_num_length_pairs[1][1] - 1) / len(all_index_pairs)
+        )
+
+        expected_prop_2 = (
+            (ep_num_length_pairs[2][1] - 1) / len(all_index_pairs)
+        )
+
+        ep_0_prop_correct = (ep_0_count / total) - expected_prop_0 < 0.03
+        ep_1_prop_correct = (ep_1_count / total) - expected_prop_1 < 0.03
+        ep_2_prop_correct = (ep_2_count / total) - expected_prop_2 < 0.03
 
         # Are timesteps from each episode appearing with a frequency
         # proportional to the length of the corresponding episode?
@@ -384,6 +405,22 @@ def verify_batch_generation(ep_num_length_pairs, agent):
             second_term and all_pairs_found and props_correct
         )
 
+        iters_since_log += 1
+        if iters_since_log == 50:
+            iters_since_log = 0
+            print(
+                f'second_term: {second_term}, '
+                f'all_pairs_found: {all_pairs_found}, '
+                f'props_correct: {props_correct}'
+            )
+            print()
+            print(agent.state['replay_buffer']['episode_probabilities'][:10])
+            print()
+            print(expected_prop_0, expected_prop_1, expected_prop_2)
+            print()
+            print(ep_0_count / total, ep_1_count / total, ep_2_count / total)
+            return
+
     ep_0_prop = ep_0_count / total
     ep_1_prop = ep_1_count / total
     ep_2_prop = ep_2_count / total
@@ -392,10 +429,56 @@ def verify_batch_generation(ep_num_length_pairs, agent):
     print(f'Proportions: {ep_0_prop:.2} {ep_1_prop:.2} {ep_2_prop:.2}')
 
 
+def inspect_rb(ep_len, agent):
+    timestep = {
+        'observation': agent.env.reset(length=ep_len)[0], 'action': 0,
+        'reward': 0, 'terminated': False
+    }
+
+    agent.run_episode(timestep)
+    agent.log()
+
+    rb = agent.state['replay_buffer']
+
+    print(rb['action'])
+    print(rb['boundaries'][:10])
+    print(rb['add_episode_index'])
+    print(rb['least_recent_bounds_index'])
+    print(rb['least_recent_bounds'])
+
+
 def test_replay_buffer():
+    # a = jnp.zeros(5)
+    # p = 0
+    # g = 0
+
+    # for i in range(1, 7):
+    #     a, g, p = circular_put(a, g, p, i)
+    #     print(a, g, p)
+
+    # print()
+
+    # for i in range(5):
+    #     n, g = circular_get(a, g)
+    #     print(a, g, n)
+
+    # return
+
     from environments.replay_test import Env
 
     agent = Agent(Env, buffer_len=210, max_ep_len=256)
+
+    # agent.state['replay_buffer']['action'] = (
+    #     agent.state['replay_buffer']['action'] + 5
+    # )
+
+    # inspect_rb(10, agent)
+    # inspect_rb(10, agent)
+    # inspect_rb(10, agent)
+
+    # inspect_rb(15, agent)
+
+    # return
 
     timestep = {
         'observation': agent.env.reset(length=100)[0], 'action': 0,
@@ -415,19 +498,23 @@ def test_replay_buffer():
     agent.log()
 
     num_ts = agent.state['replay_buffer']['timesteps_stored']
-
     assert num_ts == 200, num_ts
 
     verify_batch_generation([(0, 100), (1, 60), (2, 40)], agent)
 
     # TODO: verify exactly full buffer
+    # TODO: test wrapping boundaries array
 
-    timestep = {
-        'observation': agent.env.reset(length=40)[0], 'action': 0,
-        'reward': 0, 'terminated': False
-    }
-    agent.run_episode(timestep)
-    agent.log()
+    # timestep = {
+    #     'observation': agent.env.reset(length=40)[0], 'action': 0,
+    #     'reward': 0, 'terminated': False
+    # }
+    # agent.run_episode(timestep)
+    # agent.log()
+    inspect_rb(40, agent)
+
+    num_ts = agent.state['replay_buffer']['timesteps_stored']
+    assert num_ts == 140, num_ts
 
     verify_batch_generation([(1, 60), (2, 40), (3, 40)], agent)
 
@@ -442,7 +529,7 @@ def test_replay_buffer():
     # print(agent.state['replay_buffer']['least_recent_bounds_index'])
     # print(agent.state['replay_buffer']['boundaries'])
 
-    print('Assertions passed')
+    # print('Assertions passed')
 
 
 def display_batch(batch):
