@@ -10,15 +10,8 @@ import optax
 
 # Returns stale data if we try to get more than we have put.
 def circular_get(buffer, get_index, put_index):
-    # Increment get_index, but not if it would set it equal to put_index. This
-    # allows us to get all of the items from the buffer and then put more items
-    # in without circular_put continually incrementing get_index.
-    # incremented_get_index = (get_index + 1) % buffer.shape[0]
-    # new_get_index = jnp.where(
-    #     incremented_get_index == put_index,
-    #     get_index,
-    #     incremented_get_index
-    # )
+    # If incrementing get_index has set it equal to put_index then we have
+    # emptied the buffer and put_index should be set to -1 to record this.
     new_get_index = (get_index + 1) % buffer.shape[0]
     new_put_index = jnp.where(
         new_get_index == put_index,
@@ -28,32 +21,35 @@ def circular_get(buffer, get_index, put_index):
     return buffer[get_index], new_get_index, new_put_index
 
 
-# TODO: UPDATE COMMENTS
 def circular_put(buffer, get_index, put_index, item):
-    # If we've reached the oldest element of the buffer then we're now
-    # overwriting it so we need to shift get_index along, but we need to
-    # distinguish this from when we're writing the very first item to the
-    # buffer. We use get_index == -1 to indicate that nothing has been written
-    # yet, and then set it to zero upon writing the first item.
-    # new_get_index = jnp.where(
-    #     jnp.logical_and(
-    #         put_index == get_index,
-    #         get_index >= 0
-    #     ),
-    #     (get_index + 1) % buffer.shape[0],
-    #     jnp.maximum(0, get_index)
-    # )
-    new_put_index = (put_index + 1) % buffer.shape[0]
+    # Increment put_index, except for when it's equal to -1, which indicates
+    # that the buffer is empty. In this case set it equal to the index after
+    # get_index.
+    new_put_index = jnp.where(
+        put_index == -1,
+        (get_index + 1) % buffer.shape[0],
+        (put_index + 1) % buffer.shape[0]
+    )
 
+    # If put_index was -1 then leave get_index as it is. Otherwise if
+    # new_put_index has reached get_index then we're now overwriting the
+    # corresponding item, so increment get_index.
     new_get_index = jnp.where(
         jnp.logical_and(
-            put_index == get_index, jnp.logical_not(put_index == -1)
+            new_put_index == get_index, jnp.logical_not(put_index == -1)
         ),
         (get_index + 1) % buffer.shape[0],
         get_index
     )
 
-    return buffer.at[put_index].set(item), new_get_index, new_put_index
+    # If put_index was -1 write the item at get_index
+    write_index = jnp.where(
+        put_index == -1,
+        get_index,
+        put_index
+    )
+
+    return buffer.at[write_index].set(item), new_get_index, new_put_index
 
 
 def write_timestep(i, data):
@@ -111,6 +107,16 @@ def update_episode_probabilities(replay_buffer):
             jnp.logical_and(bounds_wrapped, inside_wrapped)
         )
 
+        # Force this to be true after adding the very first episode
+        set_prob = jnp.where(
+            jnp.logical_and(episodes_stored == 1, add_bounds_index == -1),
+            True,
+            set_prob
+        )
+
+        # If seq_len is e.g. 2 then the last timestep can never occur as the
+        # first timestep in a sequence. This means that the number of distinct
+        # sequences that can be drawn from each episode is its length - 1.
         num_sequences = end - start - (seq_len - 1)
         total_sequences = timesteps_stored - episodes_stored * (seq_len - 1)
 
@@ -151,6 +157,38 @@ def add_episode(replay_buffer):
         [start_index, end_index]
     )
 
+    # Set least_recent_bounds when writing the first episode
+    # replay_buffer['least_recent_bounds'] = jnp.where(
+    #     replay_buffer['episodes_stored'] == 0,
+    #     jnp.array([start_index, end_index]),
+    #     replay_buffer['episodes_stored']
+    # )
+
+    # (
+    #     boundaries, least_recent_bounds_index, add_bounds_index,
+    #     replay_buffer['least_recent_bounds']
+    # ) = jnp.where(
+    #         replay_buffer['episodes_stored'] == 0,
+    #         circular_get(
+    #             boundaries, least_recent_bounds_index, add_bounds_index
+    #         ),
+    #         (
+    #             boundaries, least_recent_bounds_index, add_bounds_index,
+    #             replay_buffer['least_recent_bounds']
+    #         )
+    # )
+
+    (
+        replay_buffer['least_recent_bounds'], least_recent_bounds_index,
+        add_bounds_index,
+    ) = jax.lax.cond(
+        replay_buffer['episodes_stored'] == 0,
+        circular_get,
+        lambda b, g, p: (replay_buffer['least_recent_bounds'], g, p),
+        # Operands
+        boundaries, least_recent_bounds_index, add_bounds_index
+    )
+
     replay_buffer['boundaries'] = boundaries
     replay_buffer['add_bounds_index'] = add_bounds_index
     replay_buffer['add_episode_index'] = end_index
@@ -159,17 +197,6 @@ def add_episode(replay_buffer):
     replay_buffer, _ = lax.fori_loop(
         0, length, write_timestep, (replay_buffer, start_index)
     )
-
-    # (
-    #     replay_buffer['least_recent_bounds'],
-    #     replay_buffer['least_recent_bounds_index']
-    # ) = jnp.where(
-    #     replay_buffer['episodes_stored'] == 0,
-    #     circular_get(
-    #         replay_buffer['boundaries'],
-    #         replay_buffer['least_recent_bounds_index']
-    #     )
-    # )
 
     replay_buffer['timesteps_stored'] += length
     replay_buffer['episodes_stored'] += 1
@@ -195,15 +222,18 @@ def add_episode(replay_buffer):
 
         replay_buffer['timesteps_stored'] -= end - start
         replay_buffer['episodes_stored'] -= 1
+
         jax.debug.print(
             'Removed ep of len {a} - {c}, eps stored {b}', a=end, c=start,
             b=replay_buffer['episodes_stored']
         )
 
-        least_recent_bounds, least_recent_bounds_index = circular_get(
+        (
+            least_recent_bounds, least_recent_bounds_index, add_bounds_index
+        ) = circular_get(
             replay_buffer['boundaries'],
             replay_buffer['least_recent_bounds_index'],
-            add_bounds_index
+            replay_buffer['add_bounds_index']
         )
 
         replay_buffer['least_recent_bounds'] = least_recent_bounds
@@ -472,6 +502,10 @@ def verify_batch_generation(ep_num_length_pairs, agent):
             )
             print('episode_probs[:10]:')
             print(agent.state['replay_buffer']['episode_probabilities'][:10])
+            print('episode_probs[-1]:')
+            print(agent.state['replay_buffer']['episode_probabilities'][
+                      agent.state['replay_buffer']['episode_probabilities'].shape[0] - 1
+                  ])
             print('Expected probabilities:')
             print(expected_prop_0, expected_prop_1, expected_prop_2)
             print('Actual probabilities:')
