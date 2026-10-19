@@ -18,7 +18,7 @@ attain at least average human performance on all 57 games. In the process of cre
 researchers had made inroads into some of the fundamental problems of reinforcement learning,
 such as what to do when random exploration never discovers any rewards.
 
-In the [blog post announcing this agent](https://deepmind.google/blog/agent57-outperforming-the-human-atari-benchmark/)
+In the [announcement blog post](https://deepmind.google/blog/agent57-outperforming-the-human-atari-benchmark/)
  its predecessors were referred to as the *lineage of Agent57*.
 
 This repository traces that lineage. I created it primarily to learn about the algorithms and
