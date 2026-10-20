@@ -1,4 +1,5 @@
 from random import random, randint
+from collections import defaultdict
 
 import jax
 import jax.numpy as jnp
@@ -75,20 +76,6 @@ def update_episode_probabilities(replay_buffer):
     probs = replay_buffer['episode_probabilities']
     seq_len = replay_buffer['batch']['action'].shape[1]
 
-    # replay_buffer['least_recent_bounds_index'] has been incremented by this
-    # point so the attribute name isn't accurate.
-    # least_recent_bounds_index = (
-    #     (replay_buffer['least_recent_bounds_index'] - 1)
-    #     % replay_buffer['action'].shape[0]
-    # )
-
-    # # Force this to be zero when adding the very first episode
-    # least_recent_bounds_index = jnp.where(
-    #     jnp.logical_and(episodes_stored == 1, add_bounds_index == -1),
-    #     0,
-    #     least_recent_bounds_index
-    # )
-
     # TODO: BREAKS WHEN BOUNDARIES WRAPS
     least_recent_bounds_index = replay_buffer['least_recent_bounds_index'] - 1
 
@@ -100,10 +87,11 @@ def update_episode_probabilities(replay_buffer):
         bounds_wrapped
     )
 
-    jax.debug.print(
-        'update_probs: least_recent_bounds_index: {a}, add_bounds_index: {b}',
-        a=least_recent_bounds_index, b=add_bounds_index
-    )
+    # jax.debug.print(
+    #     'update_probs: least_recent_bounds_index: {a},
+    #     ' add_bounds_index: {b}',
+    #     a=least_recent_bounds_index, b=add_bounds_index
+    # )
 
     for i, bounds in enumerate(boundaries):
         start = bounds[0]
@@ -129,19 +117,22 @@ def update_episode_probabilities(replay_buffer):
         )
 
         # Force this to be true after adding the very first episode
-        first_ep = jnp.logical_and(episodes_stored == 1, add_bounds_index == -1)
+        first_ep = jnp.logical_and(
+            episodes_stored == 1, add_bounds_index == -1
+        )
+
         set_prob = jnp.where(
             jnp.logical_and(i == 0, first_ep),
             True,
             set_prob
         )
 
-        jax.lax.cond(
-            set_prob,
-            lambda s: jax.debug.print('set_prob true on step {a}', a=s),
-            lambda s: None,
-            i
-        )
+        # jax.lax.cond(
+        #     set_prob,
+        #     lambda s: jax.debug.print('set_prob true on step {a}', a=s),
+        #     lambda s: None,
+        #     i
+        # )
 
         # jax.debug.print(
         #     'set_prob: {a}, episodes_stored: {b}, add_bounds_index: {c}',
@@ -213,12 +204,13 @@ def add_episode(rb):
         0, length, write_timestep, (rb, start_index)
     )
 
-    jax.debug.print(
-        'just added ep: {a}, least_recent_bounds_index: {c} add_bounds_index: {b}',
-        a=replay_buffer['episodes_stored'],
-        b=add_bounds_index,
-        c=rb['least_recent_bounds_index']
-    )
+    # jax.debug.print(
+    #     'just added ep: {a}, least_recent_bounds_index: {c}'
+    #     ' add_bounds_index: {b}',
+    #     a=replay_buffer['episodes_stored'],
+    #     b=add_bounds_index,
+    #     c=rb['least_recent_bounds_index']
+    # )
 
     replay_buffer['timesteps_stored'] += length
     replay_buffer['episodes_stored'] += 1
@@ -245,10 +237,10 @@ def add_episode(rb):
         replay_buffer['timesteps_stored'] -= end - start
         replay_buffer['episodes_stored'] -= 1
 
-        jax.debug.print(
-            'Removed ep of len {a} - {c}, eps stored {b}', a=end, c=start,
-            b=replay_buffer['episodes_stored']
-        )
+        # jax.debug.print(
+        #     'Removed ep of len {a} - {c}, eps stored {b}', a=end, c=start,
+        #     b=replay_buffer['episodes_stored']
+        # )
 
         (
             least_recent_bounds, least_recent_bounds_index, add_bounds_index
@@ -386,13 +378,31 @@ def generate_batch(state):
     return state
 
 
-def verify_batch_generation(ep_num_length_pairs, agent):
-    from collections import defaultdict
+def inspect_metadata(rb):
+    print(rb['action'])
+    print(rb['boundaries'][:10])
+    print(rb['add_episode_index'])
+    print(rb['least_recent_bounds_index'])
+    print(rb['least_recent_bounds'])
 
+
+def inspect_batch(batch):
+    for i in range(batch['action'].shape[0]):
+        frame0 = batch['observation'][i, :, :, 0]
+        frame1 = batch['observation'][i, :, :, 1]
+
+        print(frame0)
+        print(frame1)
+
+        print(batch['action'][i], batch['reward'][i], batch['terminated'][i])
+        print()
+
+
+def test_batch_generation(agent, num_length_pairs):
     # We count the first timestep, which means that the last timestep of each
     # episode doesn't get included in the statistics.
     all_index_pairs = []
-    for ep_num, length in ep_num_length_pairs:
+    for ep_num, length in num_length_pairs:
         all_index_pairs.extend([(ep_num, i) for i in range(length - 1)])
 
     pair_counts = defaultdict(int)
@@ -435,23 +445,20 @@ def verify_batch_generation(ep_num_length_pairs, agent):
             # penultimate step of an episode of length 100.
             penultimate_frame0 = any([
                 list(frame0[0]) == [ep_num, length - 2]
-                for ep_num, length in ep_num_length_pairs
+                for ep_num, length in num_length_pairs
             ])
 
             penultimate_frame1 = any([
                 list(frame1[0]) == [ep_num, length - 2]
-                for ep_num, length in ep_num_length_pairs
+                for ep_num, length in num_length_pairs
             ])
-
-            # penultimate_frame0 = f0_penult_0 or f0_penult_1 or f0_penult_2
-            # penultimate_frame1 = f1_penult_0 or f1_penult_1 or f1_penult_2
 
             # If frame0 is penultimate then its term value should be True,
             # otherwise its term value should be False.
             assert (
                 (penultimate_frame0 and term_pair[0])
                 or (not penultimate_frame0 and not term_pair[0])
-            ), (frame0[0, 1], term_pair[0])
+            ), (frame0, term_pair)
 
             # Same for frame1
             assert (
@@ -468,37 +475,26 @@ def verify_batch_generation(ep_num_length_pairs, agent):
         # Do all episode-timestep index pairs yet appear in our dict?
         all_pairs_found = sorted(pair_counts.keys()) == all_index_pairs
 
-        # ep_0_count = 0
-        # ep_1_count = 0
-        # ep_2_count = 0
         total = 0
-
         ep_counts = defaultdict(int)
 
         for (episode_num, step_num), count in sorted(pair_counts.items()):
             total += count
-            # match episode_num:
-            #     case 0:
-            #         ep_0_count += count
-            #     case 1:
-            #         ep_1_count += count
-            #     case 2:
-            #         ep_2_count += count
 
             ep_counts[episode_num] += count
 
         ep_0_count, ep_1_count, ep_2_count = ep_counts.values()
 
         expected_prop_0 = (
-            (ep_num_length_pairs[0][1] - 1) / len(all_index_pairs)
+            (num_length_pairs[0][1] - 1) / len(all_index_pairs)
         )
 
         expected_prop_1 = (
-            (ep_num_length_pairs[1][1] - 1) / len(all_index_pairs)
+            (num_length_pairs[1][1] - 1) / len(all_index_pairs)
         )
 
         expected_prop_2 = (
-            (ep_num_length_pairs[2][1] - 1) / len(all_index_pairs)
+            (num_length_pairs[2][1] - 1) / len(all_index_pairs)
         )
 
         ep_0_prop_correct = (ep_0_count / total) - expected_prop_0 < 0.03
@@ -516,51 +512,29 @@ def verify_batch_generation(ep_num_length_pairs, agent):
         )
 
         iter_count += 1
-        # if iters_since_log == 50:
-        #     iters_since_log = 0
-
-        try:
-            assert iter_count < 100
-        except AssertionError as ae:
-            print(f'Too many iterations for {ep_num_length_pairs}')
-            print(
-                f'second_term: {second_term}, '
-                f'all_pairs_found: {all_pairs_found}, '
-                f'props_correct: {props_correct}'
+        if iter_count >= 100:
+            episode_probs = (
+                agent.state['replay_buffer']['episode_probabilities']
             )
-            print('episode_probs[:10]:')
-            print(agent.state['replay_buffer']['episode_probabilities'][:10])
-            print('episode_probs[-1]:')
-            print(agent.state['replay_buffer']['episode_probabilities'][
-                      agent.state['replay_buffer']['episode_probabilities'].shape[0] - 1
-                  ])
-            print('Expected probabilities:')
-            print(expected_prop_0, expected_prop_1, expected_prop_2)
-            print('Actual probabilities:')
-            print(ep_0_count / total, ep_1_count / total, ep_2_count / total)
 
-            raise ae
+            last_prob = episode_probs[episode_probs.shape[0] - 1]
 
-        # episode_probs = agent.state['replay_buffer']['episode_probabilities']
+            assert second_term, second_term
 
-        # assert iters_since_log < 50, {
-        #     'second_term': f'{second_term}',
-        #     'all_pairs_found': f'{all_pairs_found}',
-        #     'props_correct': f'{props_correct}',
-        #     'episode_probs[:10]': f'{episode_probs[:10]:.3}',
-        #     'expected_props': (
-        #         f'{expected_prop_0:.3}, '
-        #         f'{expected_prop_1:.3}, '
-        #         f'{expected_prop_2:.3}'
-        #     ),
-        #     'actual_props': (
-        #         f'{ep_0_count / total:.3}, '
-        #         f'{ep_1_count / total:.3}, '
-        #         f'{ep_2_count / total:.3}'
-        #     )
-        # }
+            assert all_pairs_found, set(all_index_pairs) - set(pair_counts)
 
-    print('got out of loop')
+            assert props_correct, (
+                f'episode_probs[:5]: {episode_probs[:10]}\n'
+                f'episode_probs[-1]: {last_prob}\n'
+                f'Expected probs: {expected_prop_0}, {expected_prop_1},'
+                f' {expected_prop_2}\n'
+                f'Actual probs: {ep_0_count / total}, {ep_1_count / total},'
+                f' {ep_2_count / total}'
+            )
+
+            print(f'Too many iterations for {num_length_pairs}')
+
+            assert iter_count < 100
 
     ep_0_prop = ep_0_count / total
     ep_1_prop = ep_1_count / total
@@ -570,28 +544,10 @@ def verify_batch_generation(ep_num_length_pairs, agent):
     print(f'Proportions: {ep_0_prop:.2} {ep_1_prop:.2} {ep_2_prop:.2}')
 
 
-def inspect_rb(ep_len, agent):
-    timestep = {
-        'observation': agent.env.reset(length=ep_len)[0], 'action': 0,
-        'reward': 0, 'terminated': False
-    }
-
-    agent.run_episode(timestep)
-    agent.log()
-
-    rb = agent.state['replay_buffer']
-
-    print(rb['action'])
-    print(rb['boundaries'][:10])
-    print(rb['add_episode_index'])
-    print(rb['least_recent_bounds_index'])
-    print(rb['least_recent_bounds'])
-
-
 def test_replay_buffer():
     from environments.replay_test import Env
 
-    agent = Agent(Env, buffer_len=210, max_ep_len=256)
+    agent = Agent(Env, buffer_len=210)
 
     timestep = {
         'observation': agent.env.reset(length=100)[0], 'action': 0,
@@ -599,7 +555,6 @@ def test_replay_buffer():
     }
 
     agent.run_episode(timestep)
-
     agent.log()
 
     timestep['observation'] = agent.env.reset(length=60)[0]
@@ -613,53 +568,24 @@ def test_replay_buffer():
     num_ts = agent.state['replay_buffer']['timesteps_stored']
     assert num_ts == 200, num_ts
 
-    verify_batch_generation([(0, 100), (1, 60), (2, 40)], agent)
+    test_batch_generation(agent, [(0, 100), (1, 60), (2, 40)])
 
-    # TODO: verify exactly full buffer
+    # TODO: test exactly full buffer
     # TODO: test wrapping boundaries array
+    # TODO: test truncated episodes
 
-    # timestep = {
-    #     'observation': agent.env.reset(length=40)[0], 'action': 0,
-    #     'reward': 0, 'terminated': False
-    # }
-    # agent.run_episode(timestep)
-    # agent.log()
-    inspect_rb(40, agent)
+    timestep['observation'] = agent.env.reset(length=40)[0]
+    agent.run_episode(timestep)
+    agent.log()
+
+    # inspect_metadata(agent.state['replay_buffer'])
 
     num_ts = agent.state['replay_buffer']['timesteps_stored']
     assert num_ts == 140, num_ts
 
-    rb = agent.state['replay_buffer']
-    seq_len = rb['batch']['action'].shape[1]
-    print('Before fourth ep:')
-    print(rb['timesteps_stored'], rb['episodes_stored'], seq_len)
+    test_batch_generation(agent, [(1, 60), (2, 40), (3, 40)])
 
-    verify_batch_generation([(1, 60), (2, 40), (3, 40)], agent)
-
-    # timestep = {
-    #     'observation': agent.env.reset(length=20)[0], 'action': 0,
-    #     'reward': 0, 'terminated': False
-    # }
-    # agent.run_episode(timestep)
-    # agent.log()
-
-    # print(agent.state['replay_buffer']['observation'][20])
-    # print(agent.state['replay_buffer']['least_recent_bounds_index'])
-    # print(agent.state['replay_buffer']['boundaries'])
-
-    # print('Assertions passed')
-
-
-def display_batch(batch):
-    for i in range(batch['action'].shape[0]):
-        frame0 = batch['observation'][i, :, :, 0]
-        frame1 = batch['observation'][i, :, :, 1]
-
-        print(frame0)
-        print(frame1)
-
-        print(batch['action'][i], batch['reward'][i], batch['terminated'][i])
-        print()
+    print('Assertions passed')
 
 
 def run_episode(env, replay_buffer):
@@ -890,8 +816,8 @@ class Qnet(nnx.Module):
 
 class Agent:
     def __init__(
-        self, env_constructor, buffer_len=1e6, max_ep_len=18e3, seq_len=2,
-        min_epsilon=0.1
+        self, env_constructor, buffer_len=1_000_000, max_ep_len=18_000,
+        seq_len=2, min_epsilon=0.1
     ):
         self.log_items = {}
         self.max_ep_len = max_ep_len
