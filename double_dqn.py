@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import jax.lax as lax
 import jax.random as jrd
+from jax.tree_util import register_pytree_node_class
 from flax import nnx
 import optax
 
@@ -220,12 +221,28 @@ def add_episode(rb):
         replay_buffer['wrapped'], buffer_end_reached
     )
 
+    replay_buffer['iter_count'] = 0
+
     def overlap_check(replay_buffer):
         least_recent_ep_start = replay_buffer['least_recent_bounds'][0]
 
-        return jnp.logical_and(
+        remove_ep = jnp.logical_and(
             replay_buffer['wrapped'],
             end_index > least_recent_ep_start
+        )
+
+        jax.debug.print(
+            'least_recent_bounds {a}, end_index {b}, iter_count {c}, wrapped {d}, remove_ep {e}',
+            a=replay_buffer['least_recent_bounds'],
+            b=end_index,
+            c=replay_buffer['iter_count'],
+            d=replay_buffer['wrapped'],
+            e=remove_ep
+        )
+
+        return jnp.logical_and(
+            remove_ep,
+            replay_buffer['iter_count'] < 100
         )
 
     def update_least_recent_bounds(replay_buffer):
@@ -237,10 +254,7 @@ def add_episode(rb):
         replay_buffer['timesteps_stored'] -= end - start
         replay_buffer['episodes_stored'] -= 1
 
-        # jax.debug.print(
-        #     'Removed ep of len {a} - {c}, eps stored {b}', a=end, c=start,
-        #     b=replay_buffer['episodes_stored']
-        # )
+        replay_buffer['iter_count'] += 1
 
         (
             least_recent_bounds, least_recent_bounds_index, add_bounds_index
@@ -544,16 +558,42 @@ def test_batch_generation(agent, num_length_pairs):
     print(f'Proportions: {ep_0_prop:.2} {ep_1_prop:.2} {ep_2_prop:.2}')
 
 
+@register_pytree_node_class
+class StartLengthBuffer:
+    def __init__(self, length):
+        self.buffer = jnp.zeros((length, 2), dtype=jnp.int32)
+        self.get_index = jnp.int32(0)
+        self.put_index = jnp.int32(0)
+        self.empty = jnp.bool(True)
+
+    def tree_flatten(self):
+        children = (self.buffer, self.get_index, self.put_index, self.empty)
+        aux_data = None
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(aux_data, *children)
+
+    def put(self, item):
+        self.buffer = self.buffer.at[self.put_index].set(item)
+        self.put_index = (self.put_index + 1) % self.buffer.shape[0]
+
+        # self.get_index = jnp.where(
+        #     self.empty,
+        #     self.get_index,
+            
+        # )
+
 def test_replay_buffer():
     from environments.replay_test import Env
 
-    agent = Agent(Env, buffer_len=210)
+    agent = Agent(Env, buffer_len=210, max_ep_len=200)
 
     timestep = {
         'observation': agent.env.reset(length=100)[0], 'action': 0,
         'reward': 0, 'terminated': False
     }
-
     agent.run_episode(timestep)
     agent.log()
 
@@ -584,6 +624,16 @@ def test_replay_buffer():
     assert num_ts == 140, num_ts
 
     test_batch_generation(agent, [(1, 60), (2, 40), (3, 40)])
+
+    timestep['observation'] = agent.env.reset(length=70)[0]
+    agent.run_episode(timestep)
+    agent.log()
+
+    timestep['observation'] = agent.env.reset(length=80)[0]
+    agent.run_episode(timestep)
+    agent.log()
+
+    test_batch_generation(agent, [(1, 60), (4, 70), (5, 80)])
 
     print('Assertions passed')
 
@@ -673,7 +723,6 @@ def update_target_net(state):
     target_net = state['target_net']
 
     _, main_params = nnx.split(main_net, nnx.Param)
-    # TODO: does this in-place update get into the state dict?
     nnx.update(target_net, main_params)
 
     state['main_updates_since_target_update'] = 0
@@ -685,7 +734,6 @@ def update_nets(state):
     state = generate_batch(state)
 
     main_net = state['main_net']
-    # seq_len = state['seq_len']
     optimiser = state['optimiser']
 
     batch = state['batch']
@@ -699,7 +747,6 @@ def update_nets(state):
 
     loss, grads = loss_with_gradients(main_net, loss_batch)
 
-    # TODO: does this in-place update get into the state dict?
     optimiser.update(main_net, grads)
 
     state['main_updates_since_target_update'] += 1
@@ -796,7 +843,8 @@ def get_replay_buffer(
             'action': jnp.zeros((32, 2), dtype=jnp.int32),
             'reward': jnp.zeros((32, 2), dtype=jnp.float32),
             'terminated': jnp.zeros((32, 2), dtype=jnp.bool)
-        }
+        },
+        'iter_count': 0
     }
 
 
