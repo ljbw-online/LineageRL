@@ -560,32 +560,176 @@ def test_batch_generation(agent, num_length_pairs):
 
 @register_pytree_node_class
 class StartLengthBuffer:
-    def __init__(self, length):
+    def __init__(self, length, seq_len):
         self.buffer = jnp.zeros((length, 2), dtype=jnp.int32)
         self.get_index = jnp.int32(0)
         self.put_index = jnp.int32(0)
         self.empty = jnp.bool(True)
+        self.probabilities = jnp.zeros(length, dtype=jnp.float32)
+        self.seq_len = seq_len
+        self.update_probs = jnp.bool(False)
 
     def tree_flatten(self):
-        children = (self.buffer, self.get_index, self.put_index, self.empty)
+        children = (
+            self.buffer, self.get_index, self.put_index, self.empty,
+            self.probabilities, self.seq_len, self.update_probs
+        )
         aux_data = None
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(aux_data, *children)
+        del aux_data
+        instance = object.__new__(StartLengthBuffer)
+        (
+            buffer, get_index, put_index, empty, probabilities,
+            seq_len, update_probs
+        ) = children
+
+        instance.buffer = buffer
+        instance.get_index = get_index
+        instance.put_index = put_index
+        instance.empty = empty
+        instance.probabilities = probabilities
+        instance.seq_len = seq_len
+        instance.update_probs = update_probs
+        return instance
 
     def put(self, item):
         self.buffer = self.buffer.at[self.put_index].set(item)
-        self.put_index = (self.put_index + 1) % self.buffer.shape[0]
 
-        # self.get_index = jnp.where(
-        #     self.empty,
-        #     self.get_index,
-            
-        # )
+        equal_indices = self.put_index == self.get_index
+
+        increment_get = jnp.logical_and(
+            equal_indices, jnp.logical_not(self.empty)
+        )
+
+        # If put_index is equal to get_index and the buffer isn't empty
+        # then we're now overwriting the least recent item, so increment
+        # get_index. Alternately if the buffer is empty then leave get_index as
+        # it is.
+        self.get_index = jnp.where(
+            increment_get,
+            (self.get_index + 1) % self.buffer.shape[0],
+            self.get_index
+        )
+
+        self.put_index = (self.put_index + 1) % self.buffer.shape[0]
+        self.empty = False
+        self.update_probs = True
+
+    def get(self):
+        item = self.buffer[self.get_index]
+
+        # Erase the removed item to make sample probabilities easier to
+        # calculate later.
+        self.buffer = self.buffer.at[self.get_index].set(0)
+
+        self.get_index = (self.get_index + 1) % self.buffer.shape[0]
+
+        self.empty = self.get_index == self.put_index
+        self.update_probs = True
+
+        return item
+
+    def update_probabilities(self, probs):
+        timesteps_stored = jnp.sum(self.buffer[:, 1])
+
+        episodes_stored = jnp.where(
+            self.put_index < self.get_index,
+            self.put_index + self.buffer.shape[0] - self.get_index,
+            self.put_index - self.get_index
+        )
+
+        for i in range(probs.shape[0]):
+            probs = probs.at[i].set(
+                jnp.maximum(0, (self.buffer[i, 1] - (self.seq_len - 1)))
+                / (timesteps_stored - episodes_stored * (self.seq_len - 1))
+            )
+
+        self.update_probs = False
+        jax.debug.print('update called')
+
+        return probs
+
+    def choice(self, subkey, choices):
+        jax.debug.print('before update')
+        # If items have been added or removed since this method was last called
+        # then update the sampling probabilities.
+        self.probabilities = jax.lax.cond(
+            self.update_probs,
+            self.update_probabilities,
+            lambda p: p,
+            self.probabilities
+        )
+        jax.debug.print('after update')
+
+        return jrd.choice(
+            subkey, self.buffer, shape=choices.shape[:1], p=self.probabilities
+        )
+
+
+@jax.jit
+def test_start_length_buffer(pairs):
+    pairs.put([1, 2])
+    jax.debug.print('After first put: empty {a}', a=pairs.empty)
+
+    item = pairs.get()
+    jax.debug.print(
+        'After first get:\n{a}, empty {b}',
+        a=pairs.buffer, b=pairs.empty
+    )
+
+    for item in [[3, 4], [5, 6], [7, 8], [9, 10]]:
+        pairs.put(item)
+
+    jax.debug.print(
+        'Buffer almost full:\n{a}, empty {b}, get_index {c}, put_index {d}',
+        a=pairs.buffer, b=pairs.empty, c=pairs.get_index, d=pairs.put_index
+    )
+
+    pairs.put([11, 12])
+    jax.debug.print(
+        'Full:\n{a}, empty {b}, get_index {c}, put_index {d}',
+        a=pairs.buffer, b=pairs.empty, c=pairs.get_index, d=pairs.put_index
+    )
+
+    pairs.put([13, 14])
+    jax.debug.print(
+        '3, 4 overwritten:\n{a}, empty {b}',
+        a=pairs.buffer, b=pairs.empty
+    )
+
+    item = pairs.get()
+    jax.debug.print(
+        '5, 6 erased:\n{a}, empty {b}, item {c}',
+        a=pairs.buffer, b=pairs.empty, c=item
+    )
+
+    key = jrd.key(57)
+    key, subkey = jrd.split(key)
+
+    choices = jnp.zeros((32, 2), dtype=jnp.int32)
+
+    choices = pairs.choice(subkey, choices)
+
+    key, subkey = jrd.split(key)
+    choices = pairs.choice(subkey, choices)
+
+    # jax.debug.print('choices:\n{a}', a=choices)
+
+    jax.debug.print('probs: {a}', a=pairs.probabilities)
+
+    return pairs
+
 
 def test_replay_buffer():
+    start_len_pairs = StartLengthBuffer(5, 2)
+
+    start_len_pairs = test_start_length_buffer(start_len_pairs)
+
+    return
+
     from environments.replay_test import Env
 
     agent = Agent(Env, buffer_len=210, max_ep_len=200)
