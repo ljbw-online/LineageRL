@@ -1,5 +1,5 @@
 from random import random, randint
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 
 import jax
 import jax.numpy as jnp
@@ -170,11 +170,7 @@ def add_episode(rb):
     # If there isn't enough space for the episode at the end of the buffer
     # then put it at the beginning, otherwise put it directly after the
     # previous episode.
-    start_index = jnp.where(
-        buffer_end_reached,
-        0,
-        start_index
-    )
+    start_index = jnp.where(buffer_end_reached, 0, start_index)
 
     end_index = start_index + length
 
@@ -232,7 +228,8 @@ def add_episode(rb):
         )
 
         jax.debug.print(
-            'least_recent_bounds {a}, end_index {b}, iter_count {c}, wrapped {d}, remove_ep {e}',
+            'least_recent_bounds {a}, end_index {b}, iter_count {c},'
+            ' wrapped {d}, remove_ep {e}',
             a=replay_buffer['least_recent_bounds'],
             b=end_index,
             c=replay_buffer['iter_count'],
@@ -278,6 +275,8 @@ def add_episode(rb):
 
     replay_buffer = update_episode_probabilities(replay_buffer)
 
+    replay_buffer['episode']['step_count'] = 0
+
     return replay_buffer
 
 
@@ -301,8 +300,8 @@ def add_timestep_to_episode(timestep, episode):
     return episode
 
 
-@jax.jit
-def add_timestep(timestep, replay_buffer):
+def add_timestep(timestep, state):
+    replay_buffer = state['replay_buffer']
     episode = replay_buffer['episode']
 
     # Jax clamps too-large indices but wraps negative indices. Calculate this
@@ -320,13 +319,10 @@ def add_timestep(timestep, replay_buffer):
     )
 
     replay_buffer = lax.cond(
-        should_add_episode, add_episode, lambda rb: rb,
+        should_add_episode,
+        add_episode,
+        lambda rb: rb,
         replay_buffer
-    )
-
-    # Reset step_count if we added the episode
-    replay_buffer['episode']['step_count'] = (
-        jnp.where(should_add_episode, 0, episode['step_count'])
     )
 
     return replay_buffer
@@ -558,32 +554,133 @@ def test_batch_generation(agent, num_length_pairs):
     print(f'Proportions: {ep_0_prop:.2} {ep_1_prop:.2} {ep_2_prop:.2}')
 
 
+Timestep = namedtuple(
+    'Timestep', ['observation', 'action', 'reward', 'terminal']
+)
+
+
 @register_pytree_node_class
-class StartLengthBuffer:
-    def __init__(self, length, seq_len):
+class TimestepBuffer:
+    def __init__(self, length, obs_shape, seq_len):
+        self.observation = jnp.zeros((length,) + obs_shape, dtype=jnp.uint8)
+        self.action = jnp.zeros(length, dtype=jnp.int32)
+        self.reward = jnp.zeros(length, dtype=jnp.float32)
+        self.terminal = jnp.zeros(length, dtype=jnp.bool)
+
+        self.get_index = jnp.int32(0)
+        self.put_index = jnp.int32(0)
+        self.empty = jnp.bool(True)
+        self.seq_len
+
+    def tree_flatten(self):
+        children = (
+            self.observation, self.action, self.reward, self.terminal,
+            self.get_index, self.put_index, self.empty
+        )
+        aux_data = (self.seq_len,)
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        instance = object.__new__(TimestepBuffer)
+        seq_len = aux_data
+        (
+            observation, action, reward, terminal, get_index, put_index, empty
+        ) = children
+
+        instance.observation = observation
+        instance.action = action
+        instance.reward = reward
+        instance.terminal = terminal
+        instance.get_index = get_index
+        instance.put_index = put_index
+        instance.empty = empty
+        instance.seq_len = seq_len
+
+        return instance
+
+    def put(self, timestep):
+        self.observation = self.observation.at[self.put_index].set(
+            timestep.observation
+        )
+        self.action = self.action.at[self.put_index].set(timestep.action)
+        self.reward = self.reward.at[self.put_index].set(timestep.reward)
+        self.terminal = self.terminal.at[self.put_index].set(timestep.terminal)
+
+        increment_get = jnp.logical_and(
+            self.put_index == self.get_index, jnp.logical_not(self.empty)
+        )
+
+        # If put_index is equal to get_index and the buffer isn't empty
+        # then we're now overwriting the least recent item, so increment
+        # get_index. Alternately if the buffer is empty then leave get_index as
+        # it is.
+        self.get_index = jnp.where(
+            increment_get,
+            (self.get_index + 1) % self.buffer.shape[0],
+            self.get_index
+        )
+
+        self.put_index = (self.put_index + 1) % self.buffer.shape[0]
+        self.empty = False
+
+    def get_batch(self, key, choices):
+        batch_obs_shape = (
+            (choices.shape[0], self.seq_len,) + self.observation.shape[1:]
+        )
+
+        batch_scalars_shape = (choices.shape[0], self.seq_len - 1)
+
+        batch = {
+            'observation': jnp.zeros(batch_obs_shape, dtype=jnp.uint8),
+            'action': jnp.zeros(batch_scalars_shape, dtype=jnp.int32),
+            'reward': jnp.zeros(batch_scalars_shape, dtype=jnp.float32),
+            'terminal': jnp.zeros(batch_scalars_shape, dtype=jnp.bool)
+        }
+
+        for i, (start_index, length) in enumerate(choices):
+            key, subkey = jrd.split(key)
+            seq_start = jrd.randint(subkey, (), 0, length - (self.seq_len - 1))
+
+            for j in range(self.seq_len):
+                obs_index = (start_index + j) % self.observation.shape[0]
+                batch['observation'] = batch['observation'].at[i, j].set(
+                    self.observation[obs_index]
+                )
+
+            for batch_key in ['action', 'reward', 'terminal']:
+                batch[batch_key] = batch[batch_key].at[i].set(
+                    self.action[start_index]
+                )
+
+
+@register_pytree_node_class
+class SliceBuffer:
+    def __init__(self, length, batch_size, seq_len):
         self.buffer = jnp.zeros((length, 2), dtype=jnp.int32)
         self.get_index = jnp.int32(0)
         self.put_index = jnp.int32(0)
         self.empty = jnp.bool(True)
         self.probabilities = jnp.zeros(length, dtype=jnp.float32)
+        self.batch_size = batch_size
         self.seq_len = seq_len
         self.update_probs = jnp.bool(False)
 
     def tree_flatten(self):
         children = (
             self.buffer, self.get_index, self.put_index, self.empty,
-            self.probabilities, self.seq_len, self.update_probs
+            self.probabilities, self.update_probs
         )
-        aux_data = None
+        aux_data = (self.batch_size, self.seq_len)
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        del aux_data
-        instance = object.__new__(StartLengthBuffer)
+        instance = object.__new__(SliceBuffer)
+        batch_size, seq_len = aux_data
         (
             buffer, get_index, put_index, empty, probabilities,
-            seq_len, update_probs
+            update_probs
         ) = children
 
         instance.buffer = buffer
@@ -591,17 +688,17 @@ class StartLengthBuffer:
         instance.put_index = put_index
         instance.empty = empty
         instance.probabilities = probabilities
+        instance.batch_size = batch_size
         instance.seq_len = seq_len
         instance.update_probs = update_probs
+
         return instance
 
     def put(self, item):
         self.buffer = self.buffer.at[self.put_index].set(item)
 
-        equal_indices = self.put_index == self.get_index
-
         increment_get = jnp.logical_and(
-            equal_indices, jnp.logical_not(self.empty)
+            self.put_index == self.get_index, jnp.logical_not(self.empty)
         )
 
         # If put_index is equal to get_index and the buffer isn't empty
@@ -632,6 +729,9 @@ class StartLengthBuffer:
 
         return item
 
+    def peek(self):
+        return self.buffer[self.get_index]
+
     def update_probabilities(self, probs):
         timesteps_stored = jnp.sum(self.buffer[:, 1])
 
@@ -648,12 +748,10 @@ class StartLengthBuffer:
             )
 
         self.update_probs = False
-        jax.debug.print('update called')
 
         return probs
 
-    def choice(self, subkey, choices):
-        jax.debug.print('before update')
+    def choice(self, subkey):
         # If items have been added or removed since this method was last called
         # then update the sampling probabilities.
         self.probabilities = jax.lax.cond(
@@ -662,15 +760,16 @@ class StartLengthBuffer:
             lambda p: p,
             self.probabilities
         )
-        jax.debug.print('after update')
 
         return jrd.choice(
-            subkey, self.buffer, shape=choices.shape[:1], p=self.probabilities
+            subkey, self.buffer, shape=(self.batch_size,), p=self.probabilities
         )
 
 
 @jax.jit
-def test_start_length_buffer(pairs):
+def test_slice_buffer():
+    pairs = SliceBuffer(5, 10, 2)
+
     pairs.put([1, 2])
     jax.debug.print('After first put: empty {a}', a=pairs.empty)
 
@@ -709,26 +808,20 @@ def test_start_length_buffer(pairs):
     key = jrd.key(57)
     key, subkey = jrd.split(key)
 
-    choices = jnp.zeros((32, 2), dtype=jnp.int32)
-
-    choices = pairs.choice(subkey, choices)
+    choices = pairs.choice(subkey)
+    jax.debug.print('choices:\n{a}', a=choices)
 
     key, subkey = jrd.split(key)
-    choices = pairs.choice(subkey, choices)
+    choices = pairs.choice(subkey)
 
-    # jax.debug.print('choices:\n{a}', a=choices)
+    jax.debug.print('choices:\n{a}', a=choices)
 
     jax.debug.print('probs: {a}', a=pairs.probabilities)
 
-    return pairs
-
 
 def test_replay_buffer():
-    start_len_pairs = StartLengthBuffer(5, 2)
-
-    start_len_pairs = test_start_length_buffer(start_len_pairs)
-
-    return
+    # test_slice_buffer()
+    # return
 
     from environments.replay_test import Env
 
@@ -836,12 +929,12 @@ def get_regression_targets(state):
     ]
 
     rewards = batch['reward'][:, 0]
-    terminated = batch['terminated'][:, 0]
+    terminal = batch['terminal'][:, 0]
     gamma = state['gamma']
 
     targets = (
         rewards
-        + jnp.logical_not(terminated) * gamma * target_values_of_main_actions
+        + jnp.logical_not(terminal) * gamma * target_values_of_main_actions
     )
 
     return targets
@@ -944,7 +1037,7 @@ def get_action(obs, state):
 def train(timestep, state):
     action, state = get_action(timestep['observation'], state)
 
-    state['replay_buffer'] = add_timestep(timestep, state['replay_buffer'])
+    state = add_timestep(timestep, state)
 
     state = update_nets(state)
 
@@ -956,18 +1049,23 @@ def get_replay_buffer(
 ):
     observation_buffer_shape = (buffer_length,) + observation_shape
     observation_episode_shape = (max_episode_length,) + observation_shape
+
+    # The shortest an episode can be is two timesteps long
+    max_episodes = jnp.int32(jnp.floor(buffer_length / 2))
+
     return {
         'observation': jnp.zeros(observation_buffer_shape, dtype=jnp.uint8),
         'action': jnp.zeros(buffer_length, dtype=jnp.int32),
         'reward': jnp.zeros(buffer_length, dtype=jnp.float32),
         'terminated': jnp.zeros(buffer_length, dtype=jnp.bool),
-        'boundaries': jnp.zeros((buffer_length, 2), dtype=jnp.int32),
-        'episode_probabilities': jnp.zeros(buffer_length, dtype=jnp.float32),
-        'timesteps_stored': jnp.int32(0),
-        'episodes_stored': jnp.int32(0),
-        'add_bounds_index': jnp.int32(-1),
-        'least_recent_bounds_index': jnp.int32(0),
-        'least_recent_bounds': jnp.zeros(2, dtype=jnp.int32),
+        # 'boundaries': jnp.zeros((buffer_length, 2), dtype=jnp.int32),
+        # 'episode_probabilities': jnp.zeros(buffer_length, dtype=jnp.float32),
+        # 'timesteps_stored': jnp.int32(0),
+        # 'episodes_stored': jnp.int32(0),
+        # 'add_bounds_index': jnp.int32(-1),
+        # 'least_recent_bounds_index': jnp.int32(0),
+        # 'least_recent_bounds': jnp.zeros(2, dtype=jnp.int32),
+        'slice_buffer': SliceBuffer(max_episodes, 32, sequence_length),
         'add_episode_index': jnp.int32(0),
         'wrapped': jnp.bool(0),
         'max_episode_length': jnp.int32(max_episode_length),
