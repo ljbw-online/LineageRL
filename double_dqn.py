@@ -220,9 +220,7 @@ def add_episode(rb):
     # Write the timesteps to the main buffers
     rb = lax.fori_loop(0, length, write_timestep, rb)
 
-    jax.debug.print('add_ep: before sb.put_index {a}', a=rb['slice_buffer'].put_index)
     rb['slice_buffer'].put([start_index, length])
-    jax.debug.print('add_ep: after sb.put_index {a}', a=rb['slice_buffer'].put_index)
 
     # jax.debug.print(
     #     'start_index {a}, length {b}',
@@ -261,6 +259,7 @@ def add_timestep_to_episode(timestep, episode):
     return episode
 
 
+@jax.jit
 def add_timestep(timestep, state):
     replay_buffer = state['replay_buffer']
     episode = replay_buffer['episode']
@@ -383,152 +382,6 @@ def inspect_batch(batch):
         print()
 
 
-def test_batch_generation(agent, num_length_pairs):
-    # We count the first timestep, which means that the last timestep of each
-    # episode doesn't get included in the statistics.
-    all_index_pairs = []
-    for ep_num, length in num_length_pairs:
-        all_index_pairs.extend([(ep_num, i) for i in range(length - 1)])
-
-    pair_counts = defaultdict(int)
-
-    batch_count = 0
-    second_term = False
-    conditions_satisfied = False
-    iter_count = 0
-    while not conditions_satisfied:
-        agent.state = generate_batch(agent.state)
-        batch = agent.state['replay_buffer']['batch']
-
-        batch_count += 1
-        for i, action_pair in enumerate(batch['action']):
-            frame0 = batch['observation'][i, :, :, 0]
-            frame1 = batch['observation'][i, :, :, 1]
-
-            frame0_sum_gt_zero = frame0[0, 0] + frame0[0, 1] + frame0[1, 1] > 0
-
-            # First frame data shouldn't all be zero, except for on the very
-            # first frame, which we demark with a bottom-left value of 255.
-            assert frame0_sum_gt_zero or frame0[1, 0] == 255
-
-            # Second frame should never sum to zero
-            assert jnp.sum(frame1) > 0
-
-            # Both frames come from the same episode
-            assert frame0[0, 0] == frame1[0, 0]
-
-            # Second frame follows the first in its corresponding episode
-            assert frame1[0, 1] == frame0[0, 1] + 1
-
-            # Action we took in response to frame0 appears in frame1
-            assert frame1[1, 0] == action_pair[0]
-
-            term_pair = batch['terminated'][i]
-
-            # Are either of the frames from the penultimate timestep of one of
-            # the episodes? The -2 is because, for example, step 98 is the
-            # penultimate step of an episode of length 100.
-            penultimate_frame0 = any([
-                list(frame0[0]) == [ep_num, length - 2]
-                for ep_num, length in num_length_pairs
-            ])
-
-            penultimate_frame1 = any([
-                list(frame1[0]) == [ep_num, length - 2]
-                for ep_num, length in num_length_pairs
-            ])
-
-            # If frame0 is penultimate then its term value should be True,
-            # otherwise its term value should be False.
-            assert (
-                (penultimate_frame0 and term_pair[0])
-                or (not penultimate_frame0 and not term_pair[0])
-            ), (frame0, term_pair)
-
-            # Same for frame1
-            assert (
-                (penultimate_frame1 and term_pair[1])
-                or (not penultimate_frame1 and not term_pair[1])
-            ), (frame1[0, 1], term_pair[1])
-
-            # Have we yet seen a second timestep with terminated == True?
-            # (Just a minor sanity check)
-            second_term = second_term or term_pair[1]
-
-            pair_counts[(int(frame0[0, 0]), int(frame0[0, 1]))] += 1
-
-        # Do all episode-timestep index pairs yet appear in our dict?
-        all_pairs_found = sorted(pair_counts.keys()) == all_index_pairs
-
-        total = 0
-        ep_counts = defaultdict(int)
-
-        for (episode_num, step_num), count in sorted(pair_counts.items()):
-            total += count
-
-            ep_counts[episode_num] += count
-
-        ep_0_count, ep_1_count, ep_2_count = ep_counts.values()
-
-        expected_prop_0 = (
-            (num_length_pairs[0][1] - 1) / len(all_index_pairs)
-        )
-
-        expected_prop_1 = (
-            (num_length_pairs[1][1] - 1) / len(all_index_pairs)
-        )
-
-        expected_prop_2 = (
-            (num_length_pairs[2][1] - 1) / len(all_index_pairs)
-        )
-
-        ep_0_prop_correct = (ep_0_count / total) - expected_prop_0 < 0.03
-        ep_1_prop_correct = (ep_1_count / total) - expected_prop_1 < 0.03
-        ep_2_prop_correct = (ep_2_count / total) - expected_prop_2 < 0.03
-
-        # Are timesteps from each episode appearing with a frequency
-        # proportional to the length of the corresponding episode?
-        props_correct = (
-            ep_0_prop_correct and ep_1_prop_correct and ep_2_prop_correct
-        )
-
-        conditions_satisfied = (
-            second_term and all_pairs_found and props_correct
-        )
-
-        iter_count += 1
-        if iter_count >= 100:
-            episode_probs = (
-                agent.state['replay_buffer']['episode_probabilities']
-            )
-
-            last_prob = episode_probs[episode_probs.shape[0] - 1]
-
-            assert second_term, second_term
-
-            assert all_pairs_found, set(all_index_pairs) - set(pair_counts)
-
-            assert props_correct, (
-                f'episode_probs[:5]: {episode_probs[:10]}\n'
-                f'episode_probs[-1]: {last_prob}\n'
-                f'Expected probs: {expected_prop_0}, {expected_prop_1},'
-                f' {expected_prop_2}\n'
-                f'Actual probs: {ep_0_count / total}, {ep_1_count / total},'
-                f' {ep_2_count / total}'
-            )
-
-            print(f'Too many iterations for {num_length_pairs}')
-
-            assert iter_count < 100
-
-    ep_0_prop = ep_0_count / total
-    ep_1_prop = ep_1_count / total
-    ep_2_prop = ep_2_count / total
-
-    print(f'{batch_count} batches generated')
-    print(f'Proportions: {ep_0_prop:.2} {ep_1_prop:.2} {ep_2_prop:.2}')
-
-
 Timestep = namedtuple(
     'Timestep', ['observation', 'action', 'reward', 'terminal']
 )
@@ -616,10 +469,14 @@ class TimestepBuffer:
         subkeys = jrd.split(key, num=choices.shape[0])
 
         # TODO: can we use lax.scan here?
-        for i, (start_index, length) in enumerate(choices):
+        for i, (ep_start_index, length) in enumerate(choices):
+            random_step_count = jrd.randint(
+                subkeys[i], (), 0, length - (self.seq_len - 1)
+            )
+
             seq_start = (
-                start_index
-                + jrd.randint(subkeys[i], (), 0, length - (self.seq_len - 1))
+                (ep_start_index + random_step_count)
+                % self.observation.shape[0]
             )
 
             for j in range(self.seq_len):
@@ -682,14 +539,15 @@ class SliceBuffer:
 
         return instance
 
-    def overlap_check(self, pair):
-        item, self_copy = pair
+    @staticmethod
+    def overlap_check(pair):
+        item, slice_buffer = pair
         most_recent_start = item[0]
         most_recent_end = (
-            (most_recent_start + item[1]) % self.replay_buffer_length
+            (most_recent_start + item[1]) % slice_buffer.replay_buffer_length
         )
 
-        least_recent_start = self_copy.peek()[0]
+        least_recent_start = slice_buffer.peek()[0]
 
         # The episode has been written across the array boundary, i.e. partly
         # at the end of the array and partly at the beginning.
@@ -722,30 +580,18 @@ class SliceBuffer:
             non_wrapped_overlap, wrapped_overlap
         )
 
-        jax.debug.print(
-            'mrs {a}, mre {b}, lrs {c}, not empty {d}, lr_overlap {e}',
-            a=most_recent_start,
-            b=most_recent_end,
-            c=least_recent_start,
-            d=jnp.logical_not(self_copy.empty),
-            e=least_recent_overlapped
-        )
-
         return jnp.logical_and(
-            jnp.logical_not(self_copy.empty),
+            jnp.logical_not(slice_buffer.empty),
             least_recent_overlapped
         )
 
-    def remove_overlapped_slice(self, pair):
+    @staticmethod
+    def remove_overlapped_slice(pair):
         item, self_copy = pair
         self_copy.get()
         return item, self_copy
 
     def put(self, item):
-        jax.debug.print(
-            'SliceBuffer: putting {a}, put_index {b}',
-            a=item, b=self.put_index
-        )
         item = jnp.array(item, dtype=jnp.int32)
 
         self.buffer = self.buffer.at[self.put_index].set(item)
@@ -766,22 +612,26 @@ class SliceBuffer:
 
         # Remove slices corresponding to episodes that are being wholly or
         # partly overwritten by the current episode.
-        (removed_item, self_copy) = lax.while_loop(
+        (removed_item, modified_self) = lax.while_loop(
             self.overlap_check,
             self.remove_overlapped_slice,
             (item, self)
         )
 
-        self.get_index = self_copy.get_index
-        self.buffer = self_copy.buffer
-        self.empty = self_copy.empty
-        self.update_probs = self_copy.update_probs
+        # Inside a JITed function, if we modify an object by calling a method
+        # on it then we have to return the object from the function, otherwise
+        # the modification was a side effect. So to use while_loop we have to
+        # pass self to it and then return the instance at the end. Calling the
+        # the thing returned by while_loop "self" doesn't seem to work; we have
+        # to manually transfer the modified attributes.
+        self.get_index = modified_self.get_index
+        self.buffer = modified_self.buffer
+        self.empty = modified_self.empty
+        self.update_probs = modified_self.update_probs
 
         self.put_index = (self.put_index + 1) % self.buffer.shape[0]
         self.empty = False
         self.update_probs = True
-
-        jax.debug.print('SliceBuffer: put_index {a}', a=self.put_index)
 
     def get(self):
         item = self.buffer[self.get_index]
@@ -892,10 +742,164 @@ def test_slice_buffer():
     jax.debug.print('probs: {a}', a=pairs.probabilities)
 
 
+@jax.jit
+def get_batch(state):
+    state['key'], subkey_0, subkey_1 = jrd.split(
+        state['key'], num=3
+    )
+
+    choices = state['replay_buffer']['slice_buffer'].choice(subkey_0)
+    batch = state['replay_buffer']['timestep_buffer'].get_batch(
+        subkey_1, choices
+    )
+
+    return batch, state
+
+
+def test_batch_generation(agent, num_length_pairs):
+    timestep_buffer = agent.state['replay_buffer']['timestep_buffer']
+
+    ep_nums = [i for i, _ in num_length_pairs]
+
+    max_ep_len = agent.state['replay_buffer']['max_episode_length']
+
+    truncated_eps = dict()
+    for num, length in num_length_pairs:
+        truncated_eps[num] = length > max_ep_len
+
+    # Clip to max episode length
+    num_length_pairs = [(i, min(j, max_ep_len)) for i, j in num_length_pairs]
+
+    # We count the first timestep of each sequence, which means that the last
+    # timestep of each episode doesn't get included in the statistics.
+    all_index_pairs = []
+    for ep_num, length in num_length_pairs:
+        all_index_pairs.extend([(ep_num, i) for i in range(length - 1)])
+
+    pair_counts = defaultdict(int)
+
+    batch_count = 0
+    # second_term = False
+    conditions_satisfied = False
+    iter_count = 0
+    while not conditions_satisfied:
+        batch, agent.state = get_batch(agent.state)
+
+        batch_count += 1
+        for i, action_array in enumerate(batch['action']):
+            frame0 = batch['observation'][i, 0]
+            frame1 = batch['observation'][i, 1]
+
+            frame0_sum_gt_zero = frame0[0, 0] + frame0[0, 1] + frame0[1, 1] > 0
+
+            # First frame data shouldn't all be zero, except for on the very
+            # first frame, which we demark with a bottom-left value of 255.
+            assert frame0_sum_gt_zero or frame0[1, 0] == 255
+
+            # Frame is from an episode which is still in the replay buffer
+            assert frame0[0, 0] in ep_nums, (
+                frame0,
+                ep_nums,
+                timestep_buffer.observation[:, 0, 0]
+            )
+
+            # Second frame should never sum to zero
+            assert jnp.sum(frame1) > 0
+
+            # Both frames come from the same episode
+            assert frame0[0, 0] == frame1[0, 0], (frame0, frame1)
+
+            # Second frame follows the first in its corresponding episode
+            assert frame1[0, 1] == frame0[0, 1] + 1, (frame0, frame1)
+
+            # Action we took in response to frame0 appears in frame1
+            assert frame1[1, 0] == action_array[0], (
+                frame1,
+                action_array[0],
+                timestep_buffer.observation[:, 0],
+                timestep_buffer.action
+            )
+
+            terminal = batch['terminal'][i]
+
+            # Is the first frame from the penultimate timestep of one
+            # of the episodes? The -2 is because, for example, step 98 is the
+            # penultimate step of an episode of length 100.
+            penultimate_frame0 = any([
+                list(frame0[0]) == [ep_num, length - 2]
+                for ep_num, length in num_length_pairs
+            ])
+
+            truncated = truncated_eps[int(frame0[0, 0])]
+
+            if penultimate_frame0 and not truncated:
+                assert terminal[0], (frame0, truncated, terminal)
+            else:
+                assert not terminal[0], (frame0, truncated, terminal)
+
+            # If frame0 is penultimate then terminal should be True,
+            # otherwise it should be False.
+            # assert (
+            #     (penultimate_frame0 and terminal[0])
+            #     or (not penultimate_frame0 and not terminal[0])
+            # ), (frame0, terminal)
+
+            pair_counts[(int(frame0[0, 0]), int(frame0[0, 1]))] += 1
+
+        # Do all episode-timestep index pairs yet appear in our dict?
+        all_pairs_found = sorted(pair_counts.keys()) == all_index_pairs
+
+        total = 0
+        ep_counts = defaultdict(int)
+
+        for (episode_num, step_num), count in sorted(pair_counts.items()):
+            total += count
+            ep_counts[episode_num] += count
+
+        expected_props = [
+            (length - 1) / len(all_index_pairs)
+            for _, length in num_length_pairs
+        ]
+
+        actual_props = [
+            count / total for count in ep_counts.values()
+        ]
+
+        # Are timesteps appearing with a frequency proportional to the length
+        # of their corresponding episode?
+        props_correct = all([
+            abs(actual - expected) < 0.03
+            for actual, expected in zip(actual_props, expected_props)
+        ])
+
+        conditions_satisfied = all_pairs_found and props_correct
+
+        iter_count += 1
+        if iter_count >= 100:
+            print(f'Too many iterations for {num_length_pairs}')
+
+            assert all_pairs_found, (
+                sorted(set(all_index_pairs) - set(pair_counts))
+            )
+
+            assert props_correct, (
+                f'Expected probs: {expected_props}\n'
+                f'Actual probs: {actual_props}'
+            )
+
+            assert iter_count < 100
+
+    print(f'{batch_count} batches generated')
+    print(
+        'Proportions:',
+        ', '.join([f'{p:.2}' for p in actual_props])
+    )
+
+
 def test_replay_buffer():
     from environments.replay_test import Env
 
-    agent = Agent(Env, buffer_len=210, max_ep_len=200)
+    agent = Agent(Env, buffer_len=210, max_ep_len=104, testing=True)
 
     timestep = Timestep(
         agent.env.reset(length=100)[0], 0, 0, False
@@ -916,15 +920,12 @@ def test_replay_buffer():
     agent.run_episode(timestep)
     agent.log()
 
-    num_ts = jnp.sum(agent.state['replay_buffer']['slice_buffer'].buffer[:, 1])
     print(agent.state['replay_buffer']['slice_buffer'].buffer[:10])
+
+    num_ts = jnp.sum(agent.state['replay_buffer']['slice_buffer'].buffer[:, 1])
     assert num_ts == 200, num_ts
 
     test_batch_generation(agent, [(0, 100), (1, 60), (2, 40)])
-
-    # TODO: test exactly full buffer
-    # TODO: test wrapping boundaries array
-    # TODO: test truncated episodes
 
     timestep = Timestep(
         agent.env.reset(length=40)[0], 0, 0, False
@@ -943,13 +944,107 @@ def test_replay_buffer():
     agent.run_episode(timestep)
     agent.log()
 
+    num_ts = jnp.sum(agent.state['replay_buffer']['slice_buffer'].buffer[:, 1])
+    assert num_ts == 210, num_ts
+
+    test_batch_generation(agent, [(1, 60), (2, 40), (3, 40), (4, 70)])
+
     timestep = Timestep(
         agent.env.reset(length=80)[0], 0, 0, False
     )
     agent.run_episode(timestep)
     agent.log()
 
-    test_batch_generation(agent, [(1, 60), (4, 70), (5, 80)])
+    num_ts = jnp.sum(agent.state['replay_buffer']['slice_buffer'].buffer[:, 1])
+    assert num_ts == 190, num_ts
+
+    test_batch_generation(agent, [(3, 40), (4, 70), (5, 80)])
+
+    timestep = Timestep(
+        agent.env.reset(length=20)[0], 0, 0, False
+    )
+    agent.run_episode(timestep)
+    agent.log()
+
+    # Fill the replay buffer up exactly. This makes it easier to calculate what
+    # the episode numbers should be in the following code.
+    test_batch_generation(agent, [(3, 40), (4, 70), (5, 80), (6, 20)])
+    num_ts = jnp.sum(agent.state['replay_buffer']['slice_buffer'].buffer[:, 1])
+    assert num_ts == 210, num_ts
+
+    print('slices', agent.state['replay_buffer']['slice_buffer'].buffer[:10])
+
+    num_slice_wrap_eps = 100
+
+    # Write lots of episodes in order to wrap the slice buffer and check that
+    # batches are still correct after this.
+    print(f'running {num_slice_wrap_eps} eps')
+    for _ in range(num_slice_wrap_eps):
+        timestep = Timestep(
+            agent.env.reset(length=21)[0], 0, 0, False
+        )
+        agent.run_episode(timestep)
+        # agent.log()
+
+    print('done')
+
+    num_ts = jnp.sum(agent.state['replay_buffer']['slice_buffer'].buffer[:, 1])
+    assert num_ts == 210, num_ts
+
+    # sb = agent.state['replay_buffer']['slice_buffer'].buffer
+    # print('slice buffer after for-loop')
+    # print(sb)
+    # print(f'sb.shape[0]: {sb.shape[0]}')
+
+    num_length_pairs = [
+        (i, 21)
+        for i in range(7 + num_slice_wrap_eps - 10, 7 + num_slice_wrap_eps)
+    ]
+
+    test_batch_generation(agent, num_length_pairs)
+
+    timestep = Timestep(
+        agent.env.reset(length=120)[0], 0, 0, False
+    )
+    agent.run_episode(timestep)
+    agent.log()
+
+    print('num_length_pairs', num_length_pairs)
+
+    sb = agent.state['replay_buffer']['slice_buffer'].buffer
+    print('slices:')
+    for start, length in sb:
+        if start != 0:
+            print(start, length)
+
+    # We tried to write an ep of len 120 but max_ep_len is 110 so we only write
+    # one of 110 steps.
+    num_ts = jnp.sum(agent.state['replay_buffer']['slice_buffer'].buffer[:, 1])
+    assert num_ts == 209, num_ts
+
+    # Again the actual length written to the buffer is 110 even though we tried
+    # 120
+    test_batch_generation(
+        agent, [
+            (102, 21), (103, 21), (104, 21), (105, 21), (106, 21), (107, 120)
+        ]
+    )
+
+    timestep = Timestep(
+        agent.env.reset(length=120)[0], 0, 0, False
+    )
+    agent.run_episode(timestep)
+    agent.log()
+
+    timestep = Timestep(
+        agent.env.reset(length=120)[0], 0, 0, False
+    )
+    agent.run_episode(timestep)
+    agent.log()
+
+    test_batch_generation(
+        agent, [(108, 120), (109, 120)]
+    )
 
     print('Assertions passed')
 
@@ -1127,30 +1222,13 @@ def train(timestep, state):
 def get_replay_buffer(
     length, max_episode_length, observation_shape, sequence_length
 ):
-    # observation_buffer_shape = (length,) + observation_shape
     observation_episode_shape = (max_episode_length,) + observation_shape
 
-    # The shortest an episode can be is two timesteps long
-    # max_episodes = jnp.int32(jnp.floor(length / 2))
-
     return {
-        # 'observation': jnp.zeros(observation_buffer_shape, dtype=jnp.uint8),
-        # 'action': jnp.zeros(buffer_length, dtype=jnp.int32),
-        # 'reward': jnp.zeros(buffer_length, dtype=jnp.float32),
-        # 'terminated': jnp.zeros(buffer_length, dtype=jnp.bool),
         'timestep_buffer': TimestepBuffer(
             length, observation_shape, sequence_length
         ),
-        # 'boundaries': jnp.zeros((buffer_length, 2), dtype=jnp.int32),
-        # 'episode_probabilities': jnp.zeros(buffer_length, dtype=jnp.float32),
-        # 'timesteps_stored': jnp.int32(0),
-        # 'episodes_stored': jnp.int32(0),
-        # 'add_bounds_index': jnp.int32(-1),
-        # 'least_recent_bounds_index': jnp.int32(0),
-        # 'least_recent_bounds': jnp.zeros(2, dtype=jnp.int32),
         'slice_buffer': SliceBuffer(length, 32, sequence_length),
-        # 'add_episode_index': jnp.int32(0),
-        # 'wrapped': jnp.bool(0),
         'max_episode_length': jnp.int32(max_episode_length),
         'episode': {
             'observation': jnp.zeros(
@@ -1161,14 +1239,6 @@ def get_replay_buffer(
             'terminal': jnp.zeros(max_episode_length, dtype=jnp.bool),
             'step_count': jnp.int32(0),
         },
-        # 'batch': {
-        #     'observation': jnp.zeros(
-        #         (32,) + observation_shape + (sequence_length,), dtype=jnp.uint8
-        #     ),
-        #     'action': jnp.zeros((32, 2), dtype=jnp.int32),
-        #     'reward': jnp.zeros((32, 2), dtype=jnp.float32),
-        #     'terminated': jnp.zeros((32, 2), dtype=jnp.bool)
-        # },
         'iter_count': 0
     }
 
@@ -1190,8 +1260,9 @@ class Qnet(nnx.Module):
 class Agent:
     def __init__(
         self, env_constructor, buffer_len=1_000_000, max_ep_len=18_000,
-        seq_len=2, min_epsilon=0.1
+        seq_len=2, min_epsilon=0.1, testing=False
     ):
+        self.testing = testing
         self.log_items = {}
         self.max_ep_len = max_ep_len
         self.total_steps = 0
@@ -1244,7 +1315,11 @@ class Agent:
         terminal = False
         episode_return = 0
         for i in range(self.max_ep_len):
-            action, self.state = train(timestep, self.state)
+            if self.testing:
+                action = randint(0, self.env.action_space.n)
+                self.state = add_timestep(timestep, self.state)
+            else:
+                action, self.state = train(timestep, self.state)
 
             if terminal:
                 break
