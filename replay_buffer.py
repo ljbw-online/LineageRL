@@ -1,12 +1,10 @@
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 
 import jax
 import jax.numpy as jnp
 import jax.random as jrd
 from jax.tree_util import register_pytree_node_class
 import jax.lax as lax
-
-from train import Timestep
 
 
 @jax.jit
@@ -379,6 +377,11 @@ def get_replay_buffer(
         },
         'iter_count': 0
     }
+
+
+Timestep = namedtuple(
+    'Timestep', ['observation', 'action', 'reward', 'terminal']
+)
 
 
 @register_pytree_node_class
