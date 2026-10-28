@@ -1,15 +1,15 @@
-from environments.follow_the_dots import Env
-from agents.double_dqn import Agent
+from multiprocessing import set_start_method, Queue
 
-
-def get_env():
-    return Env(4)
+from environment_runner import EnvRunner
 
 
 def train():
+    from agents.double_dqn import Agent
+    obs_q = Queue()
+    runner = EnvRunner(obs_q)
     agent = Agent(
-        get_env, buffer_len=32_000, max_ep_len=100,
-        main_updates_per_target_update=100
+        runner, obs_q, max_ep_len=1_000,
+        # main_updates_per_target_update=100
     )
 
     num_eval_episodes = 40
@@ -26,4 +26,6 @@ def train():
 
 
 if __name__ == '__main__':
+    set_start_method('spawn')
+
     train()

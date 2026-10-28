@@ -1,5 +1,4 @@
 from random import random, randint
-from multiprocessing import Queue
 
 import jax
 import jax.numpy as jnp
@@ -10,7 +9,6 @@ import optax
 
 from common import RunningStats
 from replay_buffer import get_replay_buffer, Timestep
-from environment_runner import EnvRunner
 
 
 def write_timestep(i, replay_buffer):
@@ -173,6 +171,7 @@ def update_nets(state):
 
     optimiser.update(main_net, grads)
 
+    state['total_main_updates'] += 1
     state['main_updates_since_target_update'] += 1
     state['loss'] = loss
 
@@ -195,26 +194,39 @@ def get_action(obs, state):
     main_net = state['main_net']
     epsilon_interval = state['epsilon_interval']
     observations_collected = state['observations_collected']
-    evaluating = state['evaluating']
+    total_main_updates = state['total_main_updates']
+    initial_replay_steps = state['initial_replay_steps']
+    # evaluating = state['evaluating']
 
     interval_progress = jnp.minimum(
-        observations_collected / epsilon_interval, 1
+        total_main_updates / epsilon_interval, 1
     )
 
-    epsilon = 1 - interval_progress * state['epsilon_range']
+    epsilon = jnp.where(
+        state['evaluating'],
+        state['eval_epsilon'],
+        1 - interval_progress * state['epsilon_range']
+    )
 
-    epsilon = epsilon * jnp.float32(jnp.logical_not(evaluating))
+    # epsilon = epsilon * jnp.float32(jnp.logical_not(evaluating))
 
     state['key'], subkey_0, subkey_1 = jrd.split(state['key'], num=3)
 
-    action = lax.cond(
+    initial_replay = observations_collected < initial_replay_steps
+
+    perform_random_action = jnp.logical_or(
         jrd.uniform(subkey_0) < epsilon,
+        initial_replay
+    )
+
+    action = lax.cond(
+        perform_random_action,
         lambda _: jrd.randint(subkey_1, (), 0, state['num_actions']),
         lambda observation: jnp.argmax(main_net(observation[None, :])),
         obs
     )
 
-    state['observations_collected'] = observations_collected + 1
+    state['observations_collected'] += 1
 
     return action, state
 
@@ -225,8 +237,12 @@ def train(timestep, state):
 
     state = add_timestep(timestep, state)
 
+    initial_replay = (
+        state['observations_collected'] < state['initial_replay_steps']
+    )
+
     state = lax.cond(
-        state['evaluating'],
+        jnp.logical_or(state['evaluating'], initial_replay),
         lambda s: s,
         update_nets,
         state
@@ -251,25 +267,31 @@ class Qnet(nnx.Module):
 
 class Agent:
     def __init__(
-        self, env_constructor, buffer_len=250_000, max_ep_len=18_000,
+        self, env_runner, obs_q, buffer_len=250_000, max_ep_len=18_000,
         seq_len=2, main_updates_per_target_update=2_500, min_epsilon=0.1,
-        testing=False
+        epsilon_interval=250_000, initial_replay_steps=12_500, testing=False
     ):
         self.testing = testing
         self.log_items = {}
         self.max_ep_len = max_ep_len
         self.total_steps = 0
+        self.initial_replay_steps = initial_replay_steps
         self.return_running_mean = RunningStats()
 
-        self.obs_q = Queue()
+        self.obs_q = obs_q
 
-        self.env_runner = EnvRunner(env_constructor, self.obs_q)
+        # self.env_runner = EnvRunner(self.obs_q)
+        self.env_runner = env_runner
 
-        env = env_constructor()
-        obs_shape = env.observation_space.shape
-        num_actions = env.action_space.n
+        obs_shape, num_actions = self.obs_q.get()
 
-        self.env = env
+        # env = env_constructor()
+        # obs_shape = env.observation_space.shape
+        # num_actions = env.action_space.n
+
+        self.num_actions = num_actions
+
+        # del env
 
         rngs = nnx.Rngs(int(random() * 1e12))
         main_net = Qnet(obs_shape, num_actions, rngs)
@@ -289,10 +311,13 @@ class Agent:
             'main_updates_since_target_update': 0,
             'main_updates_per_target_update': main_updates_per_target_update,
             'epsilon_range': 1 - min_epsilon,
-            'epsilon_interval': 1_000,
+            'epsilon_interval': epsilon_interval,
             'observations_collected': 0,
             'loss': 0.0,
             'evaluating': False,
+            'eval_epsilon': 0.05,
+            'initial_replay_steps': initial_replay_steps,
+            'total_main_updates': 0
         }
 
     def train(self, num_steps):
@@ -307,7 +332,8 @@ class Agent:
                 break
 
     def get_initial_timestep(self):
-        obs, _ = self.env.reset()
+        self.env_runner.reset()
+        obs = self.obs_q.get()
         return Timestep(obs, 0, 0, False)
 
     def run_episode(self, timestep, evaluating=False):
@@ -315,7 +341,7 @@ class Agent:
         episode_return = 0
         for i in range(self.max_ep_len):
             if self.testing:
-                action = randint(0, self.env.action_space.n)
+                action = randint(0, self.num_actions)
                 self.state = add_timestep(timestep, self.state)
             else:
                 action, self.state = train(timestep, self.state)
@@ -323,7 +349,8 @@ class Agent:
             if terminal:
                 break
 
-            obs_next, reward, terminal, _, _ = self.env.step(action)
+            self.env_runner.put(int(action))
+            obs_next, reward, terminal = self.obs_q.get()
 
             timestep = Timestep(obs_next, action, reward, terminal)
 
@@ -337,6 +364,12 @@ class Agent:
         self.log_items['average return'] = (
             f'{self.return_running_mean(episode_return):.2f}'
         )
+        # self.log_items['observations_collected'] = (
+        #     f'{self.state['observations_collected']:5}'
+        # )
+        # self.log_items['total_main_updates'] = (
+        #     f'{self.state['total_main_updates']:5}'
+        # )
 
         if evaluating:
             return episode_return
