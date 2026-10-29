@@ -6,9 +6,12 @@ import jax.lax as lax
 import jax.random as jrd
 from flax import nnx
 import optax
+import numpy as np
 
-from common import RunningStats
+from common import RunningStats, Worker
+from visualisation import plot_loop
 from replay_buffer import get_replay_buffer, Timestep
+from q_networks import CNN as Qnet
 
 
 def write_timestep(i, replay_buffer):
@@ -88,6 +91,13 @@ def add_timestep(timestep, state):
         add_episode,
         lambda rb: rb,
         replay_buffer
+    )
+
+    # Can't do this inside add_episode because it only acts on replay_buffer
+    state['plot_data']['q_value_count'] = jnp.where(
+        should_add_episode,
+        0,
+        state['plot_data']['q_value_count']
     )
 
     return state
@@ -196,7 +206,6 @@ def get_action(obs, state):
     observations_collected = state['observations_collected']
     total_main_updates = state['total_main_updates']
     initial_replay_steps = state['initial_replay_steps']
-    # evaluating = state['evaluating']
 
     interval_progress = jnp.minimum(
         total_main_updates / epsilon_interval, 1
@@ -208,8 +217,6 @@ def get_action(obs, state):
         1 - interval_progress * state['epsilon_range']
     )
 
-    # epsilon = epsilon * jnp.float32(jnp.logical_not(evaluating))
-
     state['key'], subkey_0, subkey_1 = jrd.split(state['key'], num=3)
 
     initial_replay = observations_collected < initial_replay_steps
@@ -219,11 +226,37 @@ def get_action(obs, state):
         initial_replay
     )
 
-    action = lax.cond(
+    plot_data = state['plot_data']
+
+    def get_random_action(_, plot_data):
+        random_action = jrd.randint(subkey_1, (), 0, state['num_actions'])
+        return random_action, plot_data
+
+    def get_max_q_action(obs, plot_data):
+        q_values = main_net(obs[None, :])
+        action = jnp.argmax(q_values)
+        max_q_value = jnp.max(q_values)
+
+        q_value_count = plot_data['q_value_count']
+        step_count = state['replay_buffer']['episode']['step_count']
+
+        plot_data['step_counts'] = (
+            plot_data['step_counts'].at[q_value_count].set(step_count)
+        )
+
+        plot_data['q_values'] = (
+            plot_data['q_values'].at[q_value_count].set(max_q_value)
+        )
+
+        plot_data['q_value_count'] += 1
+
+        return action, plot_data
+
+    action, state['plot_data'] = lax.cond(
         perform_random_action,
-        lambda _: jrd.randint(subkey_1, (), 0, state['num_actions']),
-        lambda observation: jnp.argmax(main_net(observation[None, :])),
-        obs
+        get_random_action,
+        get_max_q_action,
+        obs, plot_data
     )
 
     state['observations_collected'] += 1
@@ -251,23 +284,9 @@ def train(timestep, state):
     return action, state
 
 
-class Qnet(nnx.Module):
-    def __init__(self, obs_shape, num_actions, rngs):
-        self.size = obs_shape[0] * obs_shape[1]
-        self.linear0 = nnx.Linear(self.size, 128, rngs=rngs)
-        self.linear1 = nnx.Linear(128, num_actions, rngs=rngs)
-
-    def __call__(self, obs_batch):
-        obs_batch = obs_batch.reshape(obs_batch.shape[0], -1) / 255.0
-        a = self.linear0(obs_batch)
-        a = nnx.gelu(a)
-        a = self.linear1(a)
-        return a
-
-
 class Agent:
     def __init__(
-        self, env_runner, obs_q, buffer_len=250_000, max_ep_len=18_000,
+        self, env_runner, obs_q, buffer_len=250_000, max_ep_len=4_500,
         seq_len=2, main_updates_per_target_update=2_500, min_epsilon=0.1,
         epsilon_interval=250_000, initial_replay_steps=12_500, testing=False
     ):
@@ -277,6 +296,7 @@ class Agent:
         self.total_steps = 0
         self.initial_replay_steps = initial_replay_steps
         self.return_running_mean = RunningStats()
+        self.plotter = Worker(plot_loop)
 
         self.obs_q = obs_q
 
@@ -298,6 +318,12 @@ class Agent:
         target_net = Qnet(obs_shape, num_actions, rngs)
         optimiser = nnx.Optimizer(main_net, optax.adam(1e-4), wrt=nnx.Param)
 
+        plot_data = {
+            'q_value_count': 0,  # Number of Q-values generated during episode
+            'step_counts': jnp.zeros((max_ep_len,), dtype=jnp.int32),
+            'q_values': jnp.zeros((max_ep_len,), dtype=jnp.float32)
+        }
+
         self.state = {
             'key': jrd.key(int(random() * 1e12)),
             'replay_buffer': get_replay_buffer(
@@ -307,7 +333,7 @@ class Agent:
             'main_net': main_net,
             'target_net': target_net,
             'optimiser': optimiser,
-            'gamma': 0.99,
+            'gamma': 0.96,  # TODO: fix net update to match algorithm 1
             'main_updates_since_target_update': 0,
             'main_updates_per_target_update': main_updates_per_target_update,
             'epsilon_range': 1 - min_epsilon,
@@ -317,7 +343,8 @@ class Agent:
             'evaluating': False,
             'eval_epsilon': 0.05,
             'initial_replay_steps': initial_replay_steps,
-            'total_main_updates': 0
+            'total_main_updates': 0,
+            'plot_data': plot_data
         }
 
     def train(self, num_steps):
@@ -339,6 +366,7 @@ class Agent:
     def run_episode(self, timestep, evaluating=False):
         terminal = False
         episode_return = 0
+        q_value_count = 0
         for i in range(self.max_ep_len):
             if self.testing:
                 action = randint(0, self.num_actions)
@@ -354,6 +382,9 @@ class Agent:
 
             timestep = Timestep(obs_next, action, reward, terminal)
 
+            if terminal or i == self.max_ep_len - 1:
+                q_value_count = self.state['plot_data']['q_value_count']
+
             episode_return += reward
 
         self.total_steps += i + 1
@@ -364,12 +395,37 @@ class Agent:
         self.log_items['average return'] = (
             f'{self.return_running_mean(episode_return):.2f}'
         )
-        # self.log_items['observations_collected'] = (
-        #     f'{self.state['observations_collected']:5}'
-        # )
-        # self.log_items['total_main_updates'] = (
-        #     f'{self.state['total_main_updates']:5}'
-        # )
+
+        rewards = np.array(
+            self.state['replay_buffer']['episode']['reward'][:i + 1]
+        )
+
+        discounted_rewards = np.empty_like(rewards)
+
+        discounted_rewards[-1] = rewards[-1]
+        for j in range(len(rewards) - 2, -1, -1):
+            discounted_rewards[j] = (
+                rewards[j] + self.state['gamma'] * discounted_rewards[j + 1]
+            )
+
+        step_counts = np.array(
+            self.state['plot_data']['step_counts'][:q_value_count]
+        )
+
+        q_values = np.array(
+            np.array(self.state['plot_data']['q_values'][:q_value_count])
+        )
+
+        assert len(q_values) == len(step_counts)
+
+        print(f'len(dr) {len(discounted_rewards)}, len(sc) {len(step_counts)}')
+        # print(discounted_rewards)
+
+        self.plotter.put((
+            discounted_rewards,
+            step_counts,
+            q_values
+        ))
 
         if evaluating:
             return episode_return

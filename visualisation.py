@@ -212,11 +212,45 @@ class Window:
         self.in_q.put(None)
 
 
+def plot_loop(in_q, out_q):
+    import matplotlib.pyplot as plt
+
+    plt.style.use("dark_background")
+
+    plt.ion()
+
+    figure, axes = plt.subplots(figsize=(10, 5), layout='constrained')
+    dr_line, = axes.plot([], [], label='discounted reward')
+    mq_line, = axes.plot([], [], label='max Q-value')
+    axes.legend(fontsize=15, loc='upper left')
+    axes.set_ylim(-0.1, 2.0)
+
+    while True:
+        d_rewards, step_counts, q_values = in_q.get()
+
+        # print(list(zip(np.arange(d_rewards.shape[0]), d_rewards)))
+
+        axes.set_xlim(0, d_rewards.shape[0])
+
+        dr_line.set_data(np.arange(d_rewards.shape[0]), d_rewards)
+        mq_line.set_data(step_counts, q_values)
+
+        # axes.relim()
+        # axes.autoscale_view()
+        figure.canvas.draw_idle()
+        figure.canvas.flush_events()
+
+
 if __name__ == '__main__':
-    from environments.follow_the_dots import Env
+    from common import Worker, rng
 
-    env = Env(2)
+    w = Worker(plot_loop)
 
-    key_map = {'left': 0, 'up': 1, 'right': 2, 'down': 3}
-
-    play_env(env, key_map)
+    while True:
+        test_data = (
+            rng.integers(0, 10, (100,)),
+            np.arange(0, 100, 2),
+            rng.integers(0, 10, (50,))
+        )
+        w.put(test_data)
+        sleep(1)

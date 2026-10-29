@@ -5,24 +5,25 @@ from environment_runner import EnvRunner
 
 def train():
     from agents.double_dqn import Agent
+
     obs_q = Queue()
     runner = EnvRunner(obs_q)
+
     agent = Agent(
-        runner, obs_q, max_ep_len=1_000,
-        # main_updates_per_target_update=100
+        runner, obs_q, buffer_len=100_000,  # max_ep_len=1_000,
     )
 
-    num_eval_episodes = 40
+    num_eval_episodes = 30
     while True:
-        agent.train(10_000)
+        agent.train(500_000)
 
         average_eval_return = agent.evaluate(num_eval_episodes)
 
         print(f'eval return {average_eval_return:.3}')
 
-        if average_eval_return > (num_eval_episodes - 1) / num_eval_episodes:
-            print('env solved')
-            break
+        # if average_eval_return > (num_eval_episodes - 1) / num_eval_episodes:
+        #     print('env solved')
+        #     break
 
 
 if __name__ == '__main__':
