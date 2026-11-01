@@ -176,7 +176,10 @@ class Window:
             height, width = shape
 
         if scale is None:
-            scale = int(500 / width)
+            if width < 500:
+                scale = int(500 / width)
+            else:
+                scale = 1
 
         scaled_height = height * scale
         scaled_width = width * scale

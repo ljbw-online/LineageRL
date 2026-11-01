@@ -333,7 +333,7 @@ class Agent:
             'main_net': main_net,
             'target_net': target_net,
             'optimiser': optimiser,
-            'gamma': 0.96,  # TODO: fix net update to match algorithm 1
+            'gamma': 0.92,  # TODO: fix net update to match algorithm 1
             'main_updates_since_target_update': 0,
             'main_updates_per_target_update': main_updates_per_target_update,
             'epsilon_range': 1 - min_epsilon,
@@ -417,9 +417,6 @@ class Agent:
         )
 
         assert len(q_values) == len(step_counts)
-
-        print(f'len(dr) {len(discounted_rewards)}, len(sc) {len(step_counts)}')
-        # print(discounted_rewards)
 
         self.plotter.put((
             discounted_rewards,

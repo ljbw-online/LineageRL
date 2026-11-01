@@ -6,57 +6,9 @@ import gymnasium as gym
 import cv2
 
 # from environments.follow_the_dots import Env
+from environments.gta import Env
 
 gym.register_envs(ale_py)  # IDE appeasement
-
-
-# def get_env_runner_fn(constructor):
-#     def env_runner(in_q, out_q):
-#         env = constructor()
-
-#         # Wait for the first reset request
-#         in_q.get()
-
-#         while True:
-#             obs, _ = env.reset()
-#             out_q.put(obs)
-#             terminal = False
-#             while True:
-#                 if terminal:
-#                     break
-
-#                 action = in_q.get()
-
-#                 # Reset requested
-#                 if action is None:
-#                     break
-
-#                 obs, reward, terminal, _, _ = env.step(action)
-#                 out_q.put((obs, reward, terminal))
-
-#     return env_runner
-
-
-# def resize(im, width=None, height=None):
-#     if width is not None and height is not None:
-#         resize_width = width
-#         resize_height = height
-#     else:
-#         im_width = im.shape[1]
-#         im_height = im.shape[0]
-
-#         if width is not None:
-#             resize_width = width
-#             resize_height = int(im_height * (width / im_width))
-#         elif height is not None:
-#             resize_height = height
-#             resize_width = int(im_width * (height / im_height))
-#         else:
-#             raise ValueError('One of width or height has to be not None')
-
-#     return cv2.resize(
-#         im, (resize_width, resize_height), interpolation=cv2.INTER_NEAREST
-#     )
 
 
 def resize_image(im):
@@ -64,8 +16,6 @@ def resize_image(im):
 
 
 def convert_to_greyscale(image):
-    # return cv2.cvtColor(observation, cv2.COLOR_BGR2GRAY)
-
     # I think the emulator actually produces RGB images, contrary to my
     # previous belief.
     return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
@@ -110,7 +60,8 @@ def step_stack(env, action):
 
 def env_runner_fn(in_q, out_q):
     # env = Env(4)
-    env = gym.make('ALE/Breakout-v5')
+    # env = gym.make('ALE/Breakout-v5')
+    env = Env()
 
     # out_q.put((env.observation_space.shape, env.action_space.n))
     out_q.put(((84, 84, 4), 4))
