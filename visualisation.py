@@ -47,26 +47,31 @@ def open_window():
 # sdl2 appears to be using BGRA but the alpha channel is ignored.
 # I was not able to find out how to get sdl2 to tell me which pixel
 # format it is using.
-def reformat_image(obs, scale):
+def reformat_image(obs, scale, bgra):
     obs = np.repeat(obs, scale, axis=0)
     obs = np.repeat(obs, scale, axis=1)
 
-    if obs.ndim == 3:
-        # Swap width and height and reverse channels dimension
+    if bgra:
+        # If obs is already BGR then only swap width and height
+        return np.moveaxis(obs, 0, 1)
+    elif obs.ndim == 3:
+        # Otherwise also reverse channels dimension
         return np.moveaxis(obs, 0, 1)[:, :, ::-1]
     else:
         rgb_obs = np.repeat(obs[:, :, None], 3, axis=2)
         return np.moveaxis(rgb_obs, 0, 1)
 
 
-def play_env(env, key_map, scale=None):
+def play_env(env, key_map, real_time=False, bgra=False):
     obs, _ = env.reset()
 
-    height, width = obs.shape[:2]
+    # height, width = obs.shape[:2]
 
-    window = Window('SDL', (height, width), scale)
-    window.update(obs)
+    # window = Window('SDL', (height, width), scale)
+    # window.update(obs)
+    window = Window(image=obs, bgra=bgra)
 
+    terminal = False
     while True:
         keys = window.get_keys()
 
@@ -75,25 +80,34 @@ def play_env(env, key_map, scale=None):
                 break
 
             action = key_map[keys[0]]
-            obs, reward, terminated, _, _ = env.step(action)
+            obs, reward, terminal, _, _ = env.step(action)
             window.update(obs)
             print(reward)
 
-            if terminated:
-                print('terminated')
-                sleep(1)
-                obs, _ = env.reset()
-                window.update(obs)
+        elif real_time:
+            action = key_map['nothing']
+            obs, reward, terminal, _, _ = env.step(action)
+            window.update(obs)
+            print(reward)
 
-        sleep(0.1)
+        if terminal:
+            print('terminated')
+            sleep(1)
+            obs, _ = env.reset()
+            window.update(obs)
+
+        sleep(0.017)
+
+    print('play_env: closing window')
+    window.close()
 
 
 def play_breakout():
     env = gym.make('ALE/Breakout-v5')
 
-    key_map = {'left': 3, 'up': 1, 'right': 2, 'down': 0}
+    key_map = {'left': 3, 'up': 1, 'right': 2, 'down': 0, 'nothing': 0}
 
-    play_env(env, key_map)
+    play_env(env, key_map, real_time=True)
 
 
 def display_observations(observations):
@@ -107,7 +121,7 @@ def display_observations(observations):
             break
 
 
-def handle_io(name, shape, scale, in_q, out_q):
+def handle_io(name, shape, scale, bgra, in_q, out_q):
     sdl2.ext.init()
 
     scaled_height, scaled_width = shape
@@ -127,7 +141,7 @@ def handle_io(name, shape, scale, in_q, out_q):
             if image is None:
                 break
 
-            view[:, :, :3] = reformat_image(image, scale)
+            view[:, :, :3] = reformat_image(image, scale, bgra)
 
         window.refresh()
 
@@ -155,7 +169,7 @@ def handle_io(name, shape, scale, in_q, out_q):
                     case sdl2.SDLK_RETURN:
                         out_q.put('enter')
 
-        sleep(0.1)
+        sleep(0.016)
 
     window.close()
     sdl2.ext.quit()
@@ -165,7 +179,9 @@ def handle_io(name, shape, scale, in_q, out_q):
 
 
 class Window:
-    def __init__(self, name='SDL', shape=None, scale=None, image=None):
+    def __init__(
+        self, name='SDL', shape=None, scale=None, image=None, bgra=False
+    ):
         self.in_q = Queue()
         self.out_q = Queue()
 
@@ -186,13 +202,13 @@ class Window:
 
         scaled_shape = (scaled_height, scaled_width)
 
-        process = Process(
+        self.process = Process(
             target=handle_io,
-            args=(name, scaled_shape, scale, self.in_q, self.out_q),
+            args=(name, scaled_shape, scale, bgra, self.in_q, self.out_q),
             daemon=True
         )
 
-        process.start()
+        self.process.start()
 
         if image is not None:
             self.update(image)
@@ -213,6 +229,7 @@ class Window:
 
     def close(self):
         self.in_q.put(None)
+        self.process.join()
 
 
 def plot_loop(in_q, out_q):
@@ -245,6 +262,8 @@ def plot_loop(in_q, out_q):
 
 
 if __name__ == '__main__':
+    play_breakout()
+    exit()
     from common import Worker, rng
 
     w = Worker(plot_loop)

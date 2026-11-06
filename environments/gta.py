@@ -150,11 +150,11 @@ def render_loop(in_q, out_q, testing):
 
 class Env:
     def __init__(self, testing=False):
-        self.num_actions = 5
-        self.max_return = 10_000
-        self.random_eval_action = 1
-        self.max_steps_per_episode = 1000
-        self.evaluation_epsilon = 0.1
+        # self.num_actions = 5
+        # self.max_return = 10_000
+        # self.random_eval_action = 1
+        # self.max_steps_per_episode = 1000
+        # self.evaluation_epsilon = 0.1
 
         # self.in_q = Queue()
         # self.frame_q = Queue()
@@ -218,7 +218,7 @@ class Env:
         # frame = self.frame_q.get()
         frame = read_or_reinit_capture(self.cap)
 
-        return frame[:, 164:1124]
+        return frame[:, 164:1124], None
 
     def step(self, action):
         terminal = False
@@ -258,7 +258,7 @@ class Env:
         # frame = self.frame_q.get()
         frame = read_or_reinit_capture(self.cap)
 
-        return frame[:, 164:1124], reward, terminal
+        return frame[:, 164:1124], reward, terminal, None, None
 
     def send_action(self, action):
         match action:
@@ -339,4 +339,8 @@ def test_env():
 
 
 if __name__ == '__main__':
-    display_captures()
+    from visualisation import play_env
+    env = Env()
+    key_map = {'left': 3, 'up': 0, 'right': 4, 'down': 2, 'nothing': 1}
+
+    play_env(env, key_map, real_time=True, bgra=True)

@@ -5,8 +5,9 @@ import ale_py
 import gymnasium as gym
 import cv2
 
+from common import Worker
 # from environments.follow_the_dots import Env
-from environments.gta import Env
+# from environments.gta import Env
 
 gym.register_envs(ale_py)  # IDE appeasement
 
@@ -58,10 +59,16 @@ def step_stack(env, action):
     return stack, stack_reward, stack_terminal
 
 
+def stack_to_flat(stack):
+    # Switch to channels-first
+    flat = np.moveaxis(obs, 2, 0)
+    return np.hstack(list(flat))
+
+
 def env_runner_fn(in_q, out_q):
     # env = Env(4)
-    # env = gym.make('ALE/Breakout-v5')
-    env = Env()
+    env = gym.make('ALE/Breakout-v5')
+    # env = Env()
 
     # out_q.put((env.observation_space.shape, env.action_space.n))
     out_q.put(((84, 84, 4), 4))
@@ -91,29 +98,19 @@ def env_runner_fn(in_q, out_q):
             out_q.put((obs, reward, terminal))
 
 
-class EnvRunner:
-    def __init__(self, out_q):
-        self.in_q = Queue()
-        self.put = self.in_q.put
+class EnvRunner(Worker):
+    def __init__(self, out_q=None):
+        super().__init__(env_runner_fn, out_q=out_q)
 
-        # env_runner_fn = get_env_runner_fn(env_constructor)
-
-        self.process = Process(
-            target=env_runner_fn,
-            args=(self.in_q, out_q),
-            daemon=True
-        )
-
-        self.process.start()
+        obs_shape, num_actions = self.get()
 
     def reset(self):
-        self.in_q.put(None)
+        self.put(None)
+        return self.get()
 
-
-def stack_to_flat(stack):
-    # Switch to channels-first
-    flat = np.moveaxis(obs, 2, 0)
-    return np.hstack(list(flat))
+    def step(self, action):
+        self.put(action)
+        return self.get()
 
 
 if __name__ == '__main__':
@@ -126,13 +123,9 @@ if __name__ == '__main__':
     max_ep_len = 30
     step_count = 0
 
-    out_q = Queue()
-    runner = EnvRunner(out_q)
+    runner = EnvRunner()
 
-    out_q.get()  # obs_shape and num_actions
-
-    runner.reset()
-    obs = out_q.get()
+    obs = runner.reset()
 
     window = Window(image=stack_to_flat(obs))
 
@@ -140,16 +133,13 @@ if __name__ == '__main__':
     while True:
         if terminal:
             sleep(1)
-            window.update(out_q.get())
         elif step_count == max_ep_len:
             print('truncating')
-            runner.reset()
-            window.update(stack_to_flat(out_q.get()))
+            obs = runner.reset()
+            window.update(stack_to_flat(obs))
             step_count = 0
 
-        runner.put(int(input()))
-
-        (obs, reward, terminal) = out_q.get()
+        obs, reward, terminal = runner.step(int(input()))
 
         window.update(stack_to_flat(obs))
 
