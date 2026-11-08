@@ -1,5 +1,3 @@
-from multiprocessing import Process, Queue
-
 import numpy as np
 import ale_py
 import gymnasium as gym

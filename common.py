@@ -78,6 +78,15 @@ class Worker:
 
         self.process.start()
 
+    def close(self):
+        # If there's anything on the queues then the main process won't exit,
+        # even if the subprocess was daemonic.
+        while not self.in_q.empty():
+            self.in_q.get()
+
+        while not self.out_q.empty():
+            self.out_q.get()
+
 
 if __name__ == '__main__':
     def fn(in_q, out_q, hello, world):

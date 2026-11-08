@@ -79,31 +79,29 @@ def read_or_reinit_capture(cap):
 def display_captures():
     from visualisation import Window
 
-    window = Window(shape=(720, 1280))
+    frame = np.zeros((720, 1280), dtype=np.uint8)
+
+    window = Window(frame)
 
     for i in range(10):
+        print('Capture', i)
         capture = get_new_capture(index=i)
 
-        window_name = f'Capture {i}'
         return_val = True
 
         while return_val:
             return_val, frame = capture.read()
 
             if frame is not None:
-                # cv2.imshow(window_name, frame)
-                # key_ord = cv2.waitKey(33)
-                window.update(frame)
-                keys = window.get_keys()
+                keys = window.update(frame)
                 sleep(0.1)
             else:
                 break
 
             if 'q' in keys:
-                window.close()
                 break
 
-    # cv2.destroyAllWindows()
+        window.close()
 
 
 def get_new_capture(index=0):
@@ -339,6 +337,8 @@ def test_env():
 
 
 if __name__ == '__main__':
+    # display_captures()
+    # exit()
     from visualisation import play_env
     env = Env()
     key_map = {'left': 3, 'up': 0, 'right': 4, 'down': 2, 'nothing': 1}

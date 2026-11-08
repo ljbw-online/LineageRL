@@ -1,5 +1,4 @@
 from time import sleep
-from multiprocessing import Process, Queue
 
 import numpy as np
 
@@ -10,46 +9,18 @@ from sdl2.ext.pixelaccess import pixels3d
 import ale_py
 import gymnasium as gym
 
+from common import Worker
+
 
 gym.register_envs(ale_py)  # IDE appeasement
-
-
-def open_window():
-    sdl2.ext.init()
-    window = sdl2.ext.Window("SDL Window", size=(840, 840))
-    surface = window.get_surface()
-    view = pixels3d(surface)
-
-    for i in range(840):
-        view[i, i] = 255
-
-    window.show()
-    running = True
-    while running:
-        events = sdl2.ext.get_events()
-        for event in events:
-            match event.type:
-                case sdl2.SDL_QUIT:
-                    running = False
-                    break
-                case sdl2.SDL_TEXTINPUT:
-                    # print(event.text.text.decode())
-                    if event.text.text.decode() == 'q':
-                        running = False
-                        break
-
-        window.refresh()
-
-        # sleep(0) can cause CPU to spin up
-        sleep(0.1)
 
 
 # sdl2 appears to be using BGRA but the alpha channel is ignored.
 # I was not able to find out how to get sdl2 to tell me which pixel
 # format it is using.
-def reformat_image(obs, scale, bgra):
-    obs = np.repeat(obs, scale, axis=0)
-    obs = np.repeat(obs, scale, axis=1)
+def reformat_image(obs, bgra):
+    # obs = np.repeat(obs, scale, axis=0)
+    # obs = np.repeat(obs, scale, axis=1)
 
     if bgra:
         # If obs is already BGR then only swap width and height
@@ -65,40 +36,37 @@ def reformat_image(obs, scale, bgra):
 def play_env(env, key_map, real_time=False, bgra=False):
     obs, _ = env.reset()
 
-    # height, width = obs.shape[:2]
-
-    # window = Window('SDL', (height, width), scale)
-    # window.update(obs)
     window = Window(image=obs, bgra=bgra)
 
+    keys = window.update(obs)
+
+    # keys = set()
     terminal = False
-    while True:
-        keys = window.get_keys()
-
+    while 'q' not in keys:
+        # Only step the environment if we have keys pressed or we're running in
+        # real time.
         if len(keys) > 0:
-            if keys[0] == 'q':
-                break
+            for key_name, num in key_map.items():
+                if key_name in keys:
+                    action = num
 
-            action = key_map[keys[0]]
             obs, reward, terminal, _, _ = env.step(action)
-            window.update(obs)
+            keys = window.update(obs)
             print(reward)
-
         elif real_time:
             action = key_map['nothing']
             obs, reward, terminal, _, _ = env.step(action)
-            window.update(obs)
+            keys = window.update(obs)
             print(reward)
 
         if terminal:
             print('terminated')
             sleep(1)
             obs, _ = env.reset()
-            window.update(obs)
+            keys = window.update(obs)
 
         sleep(0.017)
 
-    print('play_env: closing window')
     window.close()
 
 
@@ -114,40 +82,36 @@ def display_observations(observations):
     window = Window(image=observations[0])
 
     for obs in observations:
-        window.update(obs)
-        keys = window.get_keys(block=True)
+        keys = window.update(obs)
 
-        if keys == ['q']:
+        if 'q' in keys:
             break
 
 
-def handle_io(name, shape, scale, bgra, in_q, out_q):
+def sdl_io_loop(in_q, out_q, image, name, bgra):
     sdl2.ext.init()
 
-    scaled_height, scaled_width = shape
+    match image.shape:
+        case h, w:
+            height = h
+            width = w
+        case h, w, _:
+            height = h
+            width = w
 
-    window = sdl2.ext.Window(name, size=(scaled_width, scaled_height))
+    window = sdl2.ext.Window(name, size=(width, height))
 
     view = pixels3d(window.get_surface())
 
-    window.show()
-    # print('Created window with ID', sdl2.SDL_GetWindowID(window.window))
+    view[:, :, :3] = reformat_image(image, bgra)
 
+    window.show()
+
+    keys = set()
     running = True
     while running:
-        if not in_q.empty():
-            image = in_q.get()
-
-            if image is None:
-                break
-
-            view[:, :, :3] = reformat_image(image, scale, bgra)
-
-        window.refresh()
-
         events = sdl2.ext.get_events()
         for event in events:
-            # print('Window', event.window.windowID, 'got event')
             if event.type == sdl2.SDL_QUIT:
                 running = False
                 out_q.put('q')
@@ -156,80 +120,75 @@ def handle_io(name, shape, scale, bgra, in_q, out_q):
                 match event.key.keysym.sym:
                     case sdl2.SDLK_q:
                         running = False
-                        out_q.put('q')
+                        # out_q.put('q')
+                        keys.add('q')
+                        out_q.put(keys)
                         break
                     case sdl2.SDLK_LEFT:
-                        out_q.put('left')
+                        # out_q.put('left')
+                        keys.add('left')
                     case sdl2.SDLK_UP:
-                        out_q.put('up')
+                        # out_q.put('up')
+                        keys.add('up')
                     case sdl2.SDLK_RIGHT:
-                        out_q.put('right')
+                        # out_q.put('right')
+                        keys.add('right')
                     case sdl2.SDLK_DOWN:
-                        out_q.put('down')
+                        # out_q.put('down')
+                        keys.add('down')
                     case sdl2.SDLK_RETURN:
-                        out_q.put('enter')
+                        # out_q.put('enter')
+                        keys.add('enter')
+            elif event.type == sdl2.SDL_KEYUP:
+                match event.key.keysym.sym:
+                    case sdl2.SDLK_LEFT:
+                        keys.remove('left')
+                    case sdl2.SDLK_UP:
+                        keys.remove('up')
+                    case sdl2.SDLK_RIGHT:
+                        keys.remove('right')
+                    case sdl2.SDLK_DOWN:
+                        keys.remove('down')
+                    case sdl2.SDLK_RETURN:
+                        keys.remove('enter')
 
-        sleep(0.016)
+        # Respond to a new image after getting key events in order to return
+        # slightly less out-of-date key events.
+        if not in_q.empty():
+            image = in_q.get()
+
+            if image is None:
+                break
+
+            view[:, :, :3] = reformat_image(image, bgra)
+            out_q.put(keys)
+
+        window.refresh()
+
+        sleep(0.01)
 
     window.close()
     sdl2.ext.quit()
     # Possibly not necessary
-    in_q.cancel_join_thread()
-    out_q.cancel_join_thread()
+    # in_q.cancel_join_thread()
+    # out_q.cancel_join_thread()
 
 
-class Window:
-    def __init__(
-        self, name='SDL', shape=None, scale=None, image=None, bgra=False
-    ):
-        self.in_q = Queue()
-        self.out_q = Queue()
+def test_window():
+    from common import rng
 
-        if shape is None:
-            height = image.shape[0]
-            width = image.shape[1]
-        else:
-            height, width = shape
+    image = np.uint8((rng.random(250_000) * 255)).reshape((500, 500))
 
-        if scale is None:
-            if width < 500:
-                scale = int(500 / width)
-            else:
-                scale = 1
+    window = Window(image)
 
-        scaled_height = height * scale
-        scaled_width = width * scale
+    keys = set()
+    while 'q' not in keys:
+        image = np.uint8((rng.random(250_000) * 255)).reshape((500, 500))
+        keys = window.update(image)
+        print('Keys being pressed:', ' '.join(keys))
+        sleep(1)
 
-        scaled_shape = (scaled_height, scaled_width)
-
-        self.process = Process(
-            target=handle_io,
-            args=(name, scaled_shape, scale, bgra, self.in_q, self.out_q),
-            daemon=True
-        )
-
-        self.process.start()
-
-        if image is not None:
-            self.update(image)
-
-    def get_keys(self, block=False):
-        keys = []
-
-        if block:
-            keys.append(self.out_q.get(block=True))
-        else:
-            while not self.out_q.empty():
-                keys.append(self.out_q.get())
-
-        return keys
-
-    def update(self, image):
-        self.in_q.put(image)
-
-    def close(self):
-        self.in_q.put(None)
-        self.process.join()
+    window.close()
 
 
 def plot_loop(in_q, out_q):
@@ -261,18 +220,34 @@ def plot_loop(in_q, out_q):
         figure.canvas.flush_events()
 
 
-if __name__ == '__main__':
-    play_breakout()
-    exit()
-    from common import Worker, rng
+def test_plotter():
+    from common import rng
 
-    w = Worker(plot_loop)
+    plotter = Plotter()
 
     while True:
         test_data = (
-            rng.integers(0, 10, (100,)),
+            rng.random(100) * 2,
             np.arange(0, 100, 2),
-            rng.integers(0, 10, (50,))
+            rng.random(50)
         )
-        w.put(test_data)
+        plotter.put(test_data)
         sleep(1)
+
+
+class Plotter(Worker):
+    def __init__(self):
+        super().__init__(plot_loop)
+
+
+class Window(Worker):
+    def __init__(self, image, name='SDL', bgra=False):
+        super().__init__(sdl_io_loop, image, name, bgra)
+
+    def update(self, image):
+        self.put(image)
+        return self.get()
+
+
+if __name__ == '__main__':
+    play_breakout()
