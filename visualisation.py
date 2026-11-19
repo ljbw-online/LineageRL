@@ -40,7 +40,6 @@ def play_env(env, key_map, real_time=False, bgra=False):
 
     keys = window.update(obs)
 
-    # keys = set()
     terminal = False
     while 'q' not in keys:
         # Only step the environment if we have keys pressed or we're running in
@@ -52,12 +51,12 @@ def play_env(env, key_map, real_time=False, bgra=False):
 
             obs, reward, terminal, _, _ = env.step(action)
             keys = window.update(obs)
-            print(reward)
+            print(f'{reward:.2f}')
         elif real_time:
             action = key_map['nothing']
             obs, reward, terminal, _, _ = env.step(action)
             keys = window.update(obs)
-            print(reward)
+            print(f'{reward:.2f}')
 
         if terminal:
             print('terminated')
@@ -91,13 +90,8 @@ def display_observations(observations):
 def sdl_io_loop(in_q, out_q, image, name, bgra):
     sdl2.ext.init()
 
-    match image.shape:
-        case h, w:
-            height = h
-            width = w
-        case h, w, _:
-            height = h
-            width = w
+    height = image.shape[0]
+    width = image.shape[1]
 
     window = sdl2.ext.Window(name, size=(width, height))
 
@@ -120,24 +114,18 @@ def sdl_io_loop(in_q, out_q, image, name, bgra):
                 match event.key.keysym.sym:
                     case sdl2.SDLK_q:
                         running = False
-                        # out_q.put('q')
                         keys.add('q')
                         out_q.put(keys)
                         break
                     case sdl2.SDLK_LEFT:
-                        # out_q.put('left')
                         keys.add('left')
                     case sdl2.SDLK_UP:
-                        # out_q.put('up')
                         keys.add('up')
                     case sdl2.SDLK_RIGHT:
-                        # out_q.put('right')
                         keys.add('right')
                     case sdl2.SDLK_DOWN:
-                        # out_q.put('down')
                         keys.add('down')
                     case sdl2.SDLK_RETURN:
-                        # out_q.put('enter')
                         keys.add('enter')
             elif event.type == sdl2.SDL_KEYUP:
                 match event.key.keysym.sym:
@@ -169,9 +157,6 @@ def sdl_io_loop(in_q, out_q, image, name, bgra):
 
     window.close()
     sdl2.ext.quit()
-    # Possibly not necessary
-    # in_q.cancel_join_thread()
-    # out_q.cancel_join_thread()
 
 
 def test_window():
@@ -207,15 +192,11 @@ def plot_loop(in_q, out_q):
     while True:
         d_rewards, step_counts, q_values = in_q.get()
 
-        # print(list(zip(np.arange(d_rewards.shape[0]), d_rewards)))
-
         axes.set_xlim(0, d_rewards.shape[0])
 
         dr_line.set_data(np.arange(d_rewards.shape[0]), d_rewards)
         mq_line.set_data(step_counts, q_values)
 
-        # axes.relim()
-        # axes.autoscale_view()
         figure.canvas.draw_idle()
         figure.canvas.flush_events()
 

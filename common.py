@@ -59,7 +59,7 @@ class RunningStats:
 
 
 class Worker:
-    def __init__(self, function, *init_args, out_q=None):
+    def __init__(self, function, *init_args, out_q=None, daemon=True):
         self.in_q = Queue()
         self.put = self.in_q.put
 
@@ -73,7 +73,7 @@ class Worker:
         self.process = Process(
             target=function,
             args=(self.in_q, self.out_q, *init_args),
-            daemon=True
+            daemon=daemon
         )
 
         self.process.start()

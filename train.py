@@ -1,16 +1,20 @@
-from multiprocessing import set_start_method, Queue
+from multiprocessing import set_start_method  # , Queue
 
-from environment_runner import EnvRunner
+# from environment_runner import EnvRunner
+from environments.gta import Env
+# import gymnasium as gym
+
+
+def get_env():
+    return Env()
+    # return gym.make('ALE/Breakout-v5')
 
 
 def train():
     from agents.double_dqn import Agent
 
-    obs_q = Queue()
-    runner = EnvRunner(obs_q)
-
     agent = Agent(
-        runner, obs_q, buffer_len=100_000,  # max_ep_len=1_000,
+        get_env, buffer_len=100_000, max_ep_len=1_000
     )
 
     num_eval_episodes = 30

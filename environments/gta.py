@@ -1,8 +1,15 @@
-from socket import socket
+from socket import socket, AF_INET
 from time import sleep
 
 import cv2
 import numpy as np
+import sdl2
+from sdl2.ext.pixelaccess import pixels3d
+from gymnasium.spaces import Discrete
+
+from common import Worker
+from visualisation import reformat_image
+from environment_runner import downscale
 
 # Use python -m environments.gta to run this file directly
 
@@ -65,7 +72,7 @@ def read_or_reinit_capture(cap):
         print('Reinitialising capture')
         cap.release()
         sleep(1)
-        cap = cv2.VideoCapture(2, cv2.CAP_V4L2)  # Capture card
+        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)  # Capture card
         cap.set(
             cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')
         )
@@ -146,39 +153,47 @@ def render_loop(in_q, out_q, testing):
     out_q.cancel_join_thread()
 
 
+def crop_cap(frame):
+    return frame[:, 164:1124]
+
+
+def display_capture_loop(in_q, out_q):
+    sdl2.ext.init()
+
+    window = sdl2.ext.Window('GTA V', size=(1280, 720))
+    view = pixels3d(window.get_surface())
+    cap = get_new_capture()
+
+    window.show()
+
+    while True:
+        frame = read_or_reinit_capture(cap)
+        view[:, :, :3] = reformat_image(frame, bgra=True)
+
+        # Stop the desktop environment from thinking the window isn't
+        # responding.
+        sdl2.ext.get_events()
+
+        window.refresh()
+
+        if not in_q.empty():
+            in_q.get()
+            out_q.put(downscale(crop_cap(frame)))
+        else:
+            sleep(0.016)
+
+
 class Env:
     def __init__(self, testing=False):
-        # self.num_actions = 5
-        # self.max_return = 10_000
-        # self.random_eval_action = 1
-        # self.max_steps_per_episode = 1000
-        # self.evaluation_epsilon = 0.1
-
-        # self.in_q = Queue()
-        # self.frame_q = Queue()
-
-        # Start displaying capture card so I can login to Windows if necessary
-        # self.rendering_process = Process(
-        #     target=render_loop,
-        #     args=(self.in_q, self.frame_q, testing),
-        #     daemon=True
-        # )
-
-        # self.rendering_process.start()
-
-        self.sock = socket()
+        self.sock = socket(AF_INET)
 
         print('Connecting socket')
         self.connect_socket()
         print('Socket connected')
 
-        self.timestep_dtype = np.dtype([
-            ('observation', np.uint8, (84, 84)),
-            ('action', np.int32),
-            ('reward', np.float32)
-        ])
+        self.display_worker = Worker(display_capture_loop)
 
-        self.cap = get_new_capture()
+        self.action_space = Discrete(5)
 
         self.prev_position = None
         self.heading_number = 0
@@ -187,7 +202,7 @@ class Env:
     def connect_socket(self):
         while True:
             try:
-                self.sock.connect(("DESKTOP-60DJ6MK", 7001))
+                self.sock.connect(("192.168.178.70", 7001))
                 break
             except Exception as exception:
                 print(exception)
@@ -213,10 +228,14 @@ class Env:
         self.heading_number = (self.heading_number + 1) % len(headings)
         self.first_step = True
 
-        # frame = self.frame_q.get()
-        frame = read_or_reinit_capture(self.cap)
+        # Prompt the subprocess to send a frame
+        self.display_worker.put(None)
+        # frame = self.display_worker.get()
 
-        return frame[:, 164:1124], None
+        # return frame[:, 164:1124], None
+
+        downscaled_frame = self.display_worker.get()
+        return downscaled_frame, None
 
     def step(self, action):
         terminal = False
@@ -253,10 +272,13 @@ class Env:
 
         self.prev_position = position
 
-        # frame = self.frame_q.get()
-        frame = read_or_reinit_capture(self.cap)
+        self.display_worker.put(None)
+        # frame = self.display_worker.get()
 
-        return frame[:, 164:1124], reward, terminal, None, None
+        # return frame[:, 164:1124], reward, terminal, None, None
+
+        downscaled_frame = self.display_worker.get()
+        return downscaled_frame, reward, terminal, None, None
 
     def send_action(self, action):
         match action:
@@ -272,18 +294,6 @@ class Env:
                 self.sock.sendall(wd_bytes)
             case _:
                 print('Invalid action: {}'.format(action))
-
-    def pause(self):
-        self.sock.sendall(reinforcement_resumed_bytes)
-
-    def close(self):
-        self.sock.sendall(reinforcement_paused_bytes)
-        self.sock.close()
-        self.cap.release()
-
-        self.in_q.put(None)
-        # Blocks because of SDL
-        # self.rendering_process.join()
 
 
 def test_env():
@@ -323,9 +333,6 @@ def test_env():
             elif key_ord == ord('k'):
                 action = 2
 
-            # print('sending action', action)
-            # print('key_ord', key_ord)
-
             next_observation, reward, terminated = env.step(action)
             observation = next_observation
 
@@ -337,10 +344,11 @@ def test_env():
 
 
 if __name__ == '__main__':
-    # display_captures()
+    # display_capture_loop(None, None)
     # exit()
+
     from visualisation import play_env
     env = Env()
     key_map = {'left': 3, 'up': 0, 'right': 4, 'down': 2, 'nothing': 1}
 
-    play_env(env, key_map, real_time=True, bgra=True)
+    play_env(env, key_map, real_time=True, bgra=False)

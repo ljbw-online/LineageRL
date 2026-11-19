@@ -1,4 +1,5 @@
 from random import random, randint
+from multiprocessing import Queue
 
 import jax
 import jax.numpy as jnp
@@ -8,10 +9,11 @@ from flax import nnx
 import optax
 import numpy as np
 
-from common import RunningStats, Worker
-from visualisation import plot_loop
+from common import RunningStats
+from visualisation import Plotter
 from replay_buffer import get_replay_buffer, Timestep
 from q_networks import CNN as Qnet
+from environment_runner import EnvRunner
 
 
 def write_timestep(i, replay_buffer):
@@ -274,19 +276,21 @@ def train(timestep, state):
         state['observations_collected'] < state['initial_replay_steps']
     )
 
-    state = lax.cond(
-        jnp.logical_or(state['evaluating'], initial_replay),
-        lambda s: s,
-        update_nets,
-        state
-    )
+    # TODO: remove for-loop after algorithm 1 fix
+    for _ in range(4):
+        state = lax.cond(
+            jnp.logical_or(state['evaluating'], initial_replay),
+            lambda s: s,
+            update_nets,
+            state
+        )
 
     return action, state
 
 
 class Agent:
     def __init__(
-        self, env_runner, obs_q, buffer_len=250_000, max_ep_len=4_500,
+        self, env_constructor, buffer_len=250_000, max_ep_len=4_500,
         seq_len=2, main_updates_per_target_update=2_500, min_epsilon=0.1,
         epsilon_interval=250_000, initial_replay_steps=12_500, testing=False
     ):
@@ -296,22 +300,15 @@ class Agent:
         self.total_steps = 0
         self.initial_replay_steps = initial_replay_steps
         self.return_running_mean = RunningStats()
-        self.plotter = Worker(plot_loop)
+        self.plotter = Plotter()
 
-        self.obs_q = obs_q
+        self.obs_q = Queue()
 
-        # self.env_runner = EnvRunner(self.obs_q)
-        self.env_runner = env_runner
+        self.env_runner = EnvRunner(env_constructor, out_q=self.obs_q, daemon=False)
 
         obs_shape, num_actions = self.obs_q.get()
 
-        # env = env_constructor()
-        # obs_shape = env.observation_space.shape
-        # num_actions = env.action_space.n
-
         self.num_actions = num_actions
-
-        # del env
 
         rngs = nnx.Rngs(int(random() * 1e12))
         main_net = Qnet(obs_shape, num_actions, rngs)
@@ -377,6 +374,8 @@ class Agent:
             if terminal:
                 break
 
+            # Convert action to a Python int so that the subprocess doesn't
+            # have to import JAX.
             self.env_runner.put(int(action))
             obs_next, reward, terminal = self.obs_q.get()
 
@@ -390,8 +389,11 @@ class Agent:
         self.total_steps += i + 1
 
         self.log_items['timesteps collected'] = f'{self.total_steps:7}'
+        self.log_items['model updates'] = (
+            f'{self.state['total_main_updates']:7}'
+        )
         self.log_items['length'] = f'{i + 1:5}'
-        self.log_items['return'] = f'{episode_return}'
+        self.log_items['return'] = f'{episode_return:.2f}'
         self.log_items['average return'] = (
             f'{self.return_running_mean(episode_return):.2f}'
         )

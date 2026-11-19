@@ -5,7 +5,6 @@ import cv2
 
 from common import Worker
 # from environments.follow_the_dots import Env
-# from environments.gta import Env
 
 gym.register_envs(ale_py)  # IDE appeasement
 
@@ -21,7 +20,9 @@ def convert_to_greyscale(image):
 
 
 def downscale(image):
-    image = convert_to_greyscale(image)
+    if image.ndim == 3:
+        image = convert_to_greyscale(image)
+
     return resize_image(image)
 
 
@@ -63,13 +64,15 @@ def stack_to_flat(stack):
     return np.hstack(list(flat))
 
 
-def env_runner_fn(in_q, out_q):
+def env_runner_fn(in_q, out_q, env_constructor):
     # env = Env(4)
-    env = gym.make('ALE/Breakout-v5')
+    # env = gym.make('ALE/Breakout-v5')
     # env = Env()
 
+    env = env_constructor()
+
     # out_q.put((env.observation_space.shape, env.action_space.n))
-    out_q.put(((84, 84, 4), 4))
+    out_q.put(((84, 84, 4), env.action_space.n))
 
     # Wait for the first reset request
     in_q.get()
@@ -97,23 +100,36 @@ def env_runner_fn(in_q, out_q):
 
 
 class EnvRunner(Worker):
-    def __init__(self, out_q=None):
-        super().__init__(env_runner_fn, out_q=out_q)
+    def __init__(self, env_constructor, out_q=None, daemon=True):
+        super().__init__(
+            env_runner_fn, env_constructor,  out_q=out_q, daemon=daemon
+        )
 
-        obs_shape, num_actions = self.get()
+        self.dedicated_out_q = out_q is None
 
     def reset(self):
         self.put(None)
-        return self.get()
+
+        if self.dedicated_out_q:
+            return self.get()
 
     def step(self, action):
         self.put(action)
-        return self.get()
+
+        if self.dedicated_out_q:
+            return self.get()
 
 
 if __name__ == '__main__':
+    # env = gym.make('ALE/Breakout-v5')
+    # print(env.action_space.n)
+    # exit()
+
     from time import sleep
+
+    from common import rng
     from visualisation import Window
+    from environments.gta import Env
 
     from multiprocessing import set_start_method
     set_start_method('spawn')
@@ -121,7 +137,10 @@ if __name__ == '__main__':
     max_ep_len = 30
     step_count = 0
 
-    runner = EnvRunner()
+    runner = EnvRunner(Env, daemon=False)
+
+    # obs shape, num_actions
+    runner.get()
 
     obs = runner.reset()
 
@@ -129,15 +148,17 @@ if __name__ == '__main__':
 
     terminal = False
     while True:
-        if terminal:
+        if terminal or step_count == max_ep_len:
+            if step_count == max_ep_len:
+                print('truncating')
+
             sleep(1)
-        elif step_count == max_ep_len:
-            print('truncating')
             obs = runner.reset()
             window.update(stack_to_flat(obs))
             step_count = 0
 
-        obs, reward, terminal = runner.step(int(input()))
+        # obs, reward, terminal = runner.step(int(input()))
+        obs, reward, terminal = runner.step(rng.integers(0, 5))
 
         window.update(stack_to_flat(obs))
 
