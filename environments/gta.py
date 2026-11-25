@@ -1,5 +1,7 @@
 from socket import socket, AF_INET
 from time import sleep
+from collections import deque
+from threading import Thread
 
 import cv2
 import numpy as np
@@ -42,14 +44,22 @@ a_bytes = bytes([22]) + np.array([0, 1, 0, 0], dtype=np.float32).tobytes()
 d_bytes = bytes([22]) + np.array([0, 0, 0, 1], dtype=np.float32).tobytes()
 nk_bytes = bytes([22]) + np.array([0, 0, 0, 0], dtype=np.float32).tobytes()
 
+# Concrete building near flood canal
+# starting_position = np.array([1099, -265, 69], dtype=np.float32)
 
-starting_position = np.array([1099, -265, 69], dtype=np.float32)
+# Mirror park loop outside garage
+starting_position = np.array([1168, -760, 57], dtype=np.float32)
+
 teleport_bytes = (
     bytes([19, 0, 0, 0]) + starting_position.tobytes() + bytes([0])
 )
 # teleport_bytes = [0] * 17
 # teleport_bytes[0] = 19
 # teleport_bytes = bytes(teleport_bytes)
+
+vehicle_bytes = (
+    bytes([18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) + np.int32(89).tobytes()
+)
 
 headings = [152, 332]
 
@@ -176,11 +186,13 @@ def display_capture_loop(in_q, out_q):
 
         window.refresh()
 
-        if not in_q.empty():
-            in_q.get()
-            out_q.put(downscale(crop_cap(frame)))
-        else:
-            sleep(0.016)
+        # Make sure there are always frames ready for the parent process
+        if out_q.full():
+            out_q.get()
+
+        out_q.put(downscale(crop_cap(frame)))
+        # else:
+        #     sleep(0.016)
 
 
 class Env:
@@ -191,7 +203,7 @@ class Env:
         self.connect_socket()
         print('Socket connected')
 
-        self.display_worker = Worker(display_capture_loop)
+        self.display_worker = Worker(display_capture_loop, maxlen=4)
 
         self.action_space = Discrete(5)
 
@@ -199,10 +211,22 @@ class Env:
         self.heading_number = 0
         self.first_step = True
 
+        self.sock_deque = deque(maxlen=4)
+
+        def recv_loop():
+            while True:
+                self.sock_deque.append(self.sock.recv(29))
+
+        self.recv_thread = Thread(
+            target=recv_loop, args=(self.sock_deque), daemon=True
+        )
+
+        self.recv_thread.start()
+
     def connect_socket(self):
         while True:
             try:
-                self.sock.connect(("192.168.178.70", 7001))
+                self.sock.connect(("192.168.178.70", 7002))
                 break
             except Exception as exception:
                 print(exception)
@@ -213,6 +237,7 @@ class Env:
             try:
                 # sets control normals to 0
                 self.sock.sendall(reinforcement_resumed_bytes)
+                self.sock.sendall(vehicle_bytes)
                 self.sock.sendall(teleport_bytes)
                 self.sock.sendall(
                     get_heading_bytes(headings[self.heading_number])
@@ -229,11 +254,10 @@ class Env:
         self.first_step = True
 
         # Prompt the subprocess to send a frame
-        self.display_worker.put(None)
-        # frame = self.display_worker.get()
+        # self.display_worker.put(None)
 
-        # return frame[:, 164:1124], None
-
+        # The Queue can contain frames from the end of the previous episode but
+        # hopefully this isn't too disruptive to learning.
         downscaled_frame = self.display_worker.get()
         return downscaled_frame, None
 
@@ -243,7 +267,17 @@ class Env:
         while True:
             try:
                 self.send_action(action)
-                recv_bytes = self.sock.recv(29)
+                # recv_bytes = self.sock.recv(29)
+                while len(self.sock_deque) == 0:
+                    sleep(0.0001)
+
+                recv_bytes = self.sock_deque.popleft()
+
+                # modToBotMessage.state == 23
+                if recv_bytes[0] != 23:
+                    # bytes from socket have become unaligned with messages
+                    print('Env.step: recv_bytes[0] != 23')
+
                 break
             except Exception as ex:
                 print(ex)
@@ -257,12 +291,14 @@ class Env:
         )
 
         submerged = bool(recv_bytes[17])
+        offroad = bool(recv_bytes[18])
 
         if self.first_step:
             self.prev_position = position.copy()
             self.first_step = False
 
-        if submerged:
+        if submerged or offroad:
+            print(f'Env.step: submerged {submerged}, offroad {offroad}')
             reward = np.float32(0)
             terminal = True
         else:
@@ -271,11 +307,6 @@ class Env:
             )
 
         self.prev_position = position
-
-        self.display_worker.put(None)
-        # frame = self.display_worker.get()
-
-        # return frame[:, 164:1124], reward, terminal, None, None
 
         downscaled_frame = self.display_worker.get()
         return downscaled_frame, reward, terminal, None, None

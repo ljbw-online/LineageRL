@@ -59,12 +59,18 @@ class RunningStats:
 
 
 class Worker:
-    def __init__(self, function, *init_args, out_q=None, daemon=True):
+    def __init__(
+        self, function, *init_args, out_q=None, daemon=True, maxlen=None
+    ):
         self.in_q = Queue()
         self.put = self.in_q.put
 
         if out_q is None:
-            self.out_q = Queue()
+            if maxlen is None:
+                self.out_q = Queue()
+            else:
+                self.out_q = Queue(maxlen)
+
             self.get = self.out_q.get
         else:
             # Shared output queue

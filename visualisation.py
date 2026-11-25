@@ -192,7 +192,7 @@ def plot_loop(in_q, out_q):
     while True:
         d_rewards, step_counts, q_values = in_q.get()
 
-        axes.set_xlim(0, d_rewards.shape[0])
+        axes.set_xlim(0, d_rewards.shape[0] - 1)
 
         dr_line.set_data(np.arange(d_rewards.shape[0]), d_rewards)
         mq_line.set_data(step_counts, q_values)
